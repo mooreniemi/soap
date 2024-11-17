@@ -6,4 +6,8 @@ rustflags = [
 ]
 
 [env]
+# Python environment setup
+# These are needed so the embedded Python can find its standard library and packages
 PYO3_PYTHON = "/opt/homebrew/bin/python3.12"
+PYTHONHOME = "/opt/homebrew/Cellar/python@3.12/3.12.6/Frameworks/Python.framework/Versions/3.12"
+PYTHONPATH = "/opt/homebrew/Cellar/python@3.12/3.12.6/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages"

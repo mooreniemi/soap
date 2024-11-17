@@ -19,6 +19,15 @@ regex = "1.5"
 notify = "6.0"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 rand = "0.8"
+futures = "0.3"
+tower = { version = "0.4", features = ["buffer"] }
+tower-http = { version = "0.4", features = ["trace"] }
+governor = "0.6"
+nonzero_ext = "0.3"
+
+[[bin]]
+name = "soap"
+path = "src/main.rs"
 
 [[bin]]
 name = "load_test"
