@@ -5,6 +5,7 @@ use tracing::info;
 use std::sync::Arc;
 use crate::versioned_modules::VersionedModules;
 use super::Snake;
+use serde_json::Value;
 
 pub struct FeatureEngineeringHandler;
 
@@ -68,27 +69,28 @@ impl Snake for FeatureEngineeringHandler {
     }
 
     fn function_name() -> &'static str {
-        "min_max_scale"
+        "engineer_features"
     }
 
     async fn handle(
-        Json(input): Json<Self::Input>,
+        input: Json<Self::Input>,
         versioned_modules: Arc<VersionedModules>,
-    ) -> Json<serde_json::Value> {
+    ) -> Json<Value> {
         let total_start = Instant::now();
 
         let lock_start = Instant::now();
-        let (actual_version, module) = versioned_modules
+        let (actual_version, modules) = versioned_modules
             .get_module_with_version(Self::script_name(), input.version.clone())
             .expect("Failed to get module");
         let lock_duration = lock_start.elapsed();
 
         let gil_start = Instant::now();
         let result: Vec<f64> = VersionedModules::call_module_function(
-            &module,
+            &modules,
             Self::function_name(),
-            (input.data,)
-        ).expect("Failed to call engineer_features");
+            (input.data.clone(),),
+            &versioned_modules.interpreter_semaphore,
+        ).await.expect("Failed to call engineer_features");
         let gil_duration = gil_start.elapsed();
 
         let total_duration = total_start.elapsed();

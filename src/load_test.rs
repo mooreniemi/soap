@@ -1,22 +1,46 @@
+use clap::Parser;
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Target transactions per second
+    #[arg(long, env = "TARGET_TPS", default_value = "100")]
+    target_tps: u64,
+
+    /// Duration to run the test in seconds
+    #[arg(long, env = "TEST_DURATION_SECS", default_value = "10")]
+    duration_secs: u64,
+
+    /// Server URL
+    #[arg(long, env = "SERVER_URL", default_value = "http://127.0.0.1:3000/onehot")]
+    server_url: String,
+}
+
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+
     // Configuration
-    let server_url = "http://127.0.0.1:3000/onehot";
     let categories = vec!["cat", "dog", "mouse", "elephant"];
-    let request_rate = 100; // Requests per second
-    let total_requests = 1000;
+    let request_rate = args.target_tps;
+    let total_requests = request_rate * args.duration_secs;
+
+    println!("Starting load test with:");
+    println!("  Target TPS: {}", request_rate);
+    println!("  Duration: {} seconds", args.duration_secs);
+    println!("  Total Requests: {}", total_requests);
+    println!("  Server URL: {}", args.server_url);
 
     // HTTP client
     let client = Client::new();
 
     // Leaky bucket semaphore to control rate
-    let bucket = Arc::new(Semaphore::new(request_rate));
+    let bucket = Arc::new(Semaphore::new(request_rate as usize));
 
     // Collect latencies and server metrics
     let mut latencies = vec![];
@@ -25,12 +49,13 @@ async fn main() {
     let mut total_durations = vec![];
 
     let mut handles = vec![];
+    let start_time = Instant::now();
 
     for _ in 0..total_requests {
         let client = client.clone();
         let bucket = Arc::clone(&bucket);
         let categories = categories.clone();
-        let url = server_url.to_string();
+        let url = args.server_url.clone();
 
         // Spawn a task for each request
         let handle = tokio::spawn(async move {

@@ -86,6 +86,6 @@ There is an extremely simple load test in `src/load_test.rs`.
 It is just pointing at the `onehot` endpoint.
 
 ```
-cargo run # the server
+cargo run --bin soap # the server
 cargo run --bin load_test
 ```

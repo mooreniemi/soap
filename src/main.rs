@@ -29,6 +29,10 @@ struct Args {
     /// Directory containing Python scripts
     #[arg(long, env = "SCRIPTS_DIR")]
     scripts_dir: Option<String>,
+
+    /// Number of Python interpreters to use
+    #[arg(long, env = "NUM_INTERPRETERS", default_value = "1")]
+    num_interpreters: usize,
 }
 
 #[tokio::main]
@@ -57,7 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Load initial modules
-    let versioned_modules = Arc::new(VersionedModules::load_modules(&scripts_dir)?);
+    let versioned_modules = Arc::new(VersionedModules::load_modules(
+        &scripts_dir,
+        args.num_interpreters,
+    )?);
 
     // Set up file watcher
     watcher::spawn_file_watcher(
@@ -83,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // You can compose endpoints! But then you have to handle the input and output types yourself.
     // And with versions, you only choose the first input version...
     // But you can do it!
+    // TODO: abstract even this function such that per request you could compose different endpoints...
     async fn compose_endpoint(
         State(versioned_modules): State<Arc<VersionedModules>>,
         input: Json<OneHotInput>,

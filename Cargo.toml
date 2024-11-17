@@ -18,6 +18,7 @@ semver = "1.0"
 regex = "1.5"
 notify = "6.0"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+rand = "0.8"
 
 [[bin]]
 name = "load_test"
