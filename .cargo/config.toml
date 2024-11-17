@@ -1,0 +1,9 @@
+[build]
+rustflags = [
+    "-L", "/opt/homebrew/opt/python@3.12/Frameworks/Python.framework/Versions/3.12/lib",
+    "-lpython3.12",
+    "-C", "link-args=-framework CoreFoundation"
+]
+
+[env]
+PYO3_PYTHON = "/opt/homebrew/bin/python3.12"
