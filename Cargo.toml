@@ -24,6 +24,9 @@ tower = { version = "0.4", features = ["buffer"] }
 tower-http = { version = "0.4", features = ["trace"] }
 governor = "0.6"
 nonzero_ext = "0.3"
+futures-util = "0.3"
+dashmap = "5"
+uuid = { version = "1.0", features = ["v4"] }
 
 [[bin]]
 name = "soap"
