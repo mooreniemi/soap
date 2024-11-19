@@ -187,21 +187,99 @@ curl -X POST http://localhost:3000/endpoint/C -H "Content-Type: application/json
 # Response: {"value": 8}
 
 
-# 5. Node D - multiplies its inputs
-curl -X POST http://localhost:3000/endpoint/D -H "Content-Type: application/json" -d '{
+# 5. External Inputs - provide values instead of computing source nodes
+curl -X POST http://localhost:3000/compose -H "Content-Type: application/json" -d '{
+  "nodes": {
+    "B": {
+      "depends_on": ["A"]
+    },
+    "C": {
+      "depends_on": ["A"]
+    }
+  },
   "inputs": {
-    "B": 4,
-    "C": 7
+    "A": 5
   }
 }'
-# Response: {"value": 28}
+# Response: {"request_id":"uuid","outputs":{"B":{"value":10},"C":{"value":10}}}
 
 
-# 6. Error case - wrong input type
-curl -X POST http://localhost:3000/endpoint/B -H "Content-Type: application/json" -d '{
-  "inputs": {
-    "A": "not a number"
+# 6. Error in Middle of Execution - shows error propagation
+curl -X POST http://localhost:3000/compose -H "Content-Type: application/json" -d '{
+  "nodes": {
+    "A": {
+      "depends_on": [],
+      "cache_output": true
+    },
+    "B": {
+      "depends_on": ["A"],
+      "params": {
+        "return_string": true
+      }
+    },
+    "C": {
+      "depends_on": ["A"]
+    },
+    "D": {
+      "depends_on": ["B", "C"]
+    }
   }
 }'
-# Response: {"error": "expects numeric input"}
+# Response: {"error": "Node D expects numeric input"}
+
+
+# 7. Mixed Cached and New Computation
+# First request - cache initial results
+curl -X POST http://localhost:3000/compose -H "Content-Type: application/json" -d '{
+  "nodes": {
+    "A": {
+      "depends_on": [],
+      "cache_output": true
+    },
+    "B": {
+      "depends_on": ["A"],
+      "cache_output": true
+    }
+  }
+}'
+# Response: {"request_id":"123-xyz","outputs":{"A":{"value":2},"B":{"value":4}}}
+
+# Second request - mix cached and new nodes
+curl -X POST http://localhost:3000/compose -H "Content-Type: application/json" -d '{
+  "request_id": "123-xyz",
+  "nodes": {
+    "A": {
+      "depends_on": [],
+      "use_cached_inputs": true
+    },
+    "B": {
+      "depends_on": ["A"],
+      "use_cached_inputs": true
+    },
+    "C": {
+      "depends_on": ["A"]
+    },
+    "D": {
+      "depends_on": ["B", "C"]
+    }
+  }
+}'
+# Response: {"request_id":"123-xyz","outputs":{"A":{"value":2},"B":{"value":4},"C":{"value":7},"D":{"value":28}}}
+
+
+# 8. Cache Override Error
+curl -X POST http://localhost:3000/compose -H "Content-Type: application/json" -d '{
+  "nodes": {
+    "A": {
+      "depends_on": [],
+      "cache_output": false
+    },
+    "B": {
+      "depends_on": ["A"],
+      "use_cached_inputs": true
+    }
+  }
+}'
+# Response: {"error": "Node A requires cached input from A, but A has caching disabled"}
+
 ```
