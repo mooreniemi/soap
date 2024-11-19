@@ -16,7 +16,7 @@ impl Snake for FeatureEngineeringHandler {
     }
 
     fn function_name() -> &'static str {
-        "engineer_features"
+        "min_max_scale"
     }
 
     async fn handle(

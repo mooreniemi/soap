@@ -1,17 +1,20 @@
 use axum::error_handling::HandleErrorLayer;
-use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::{BoxError, Json};
 use axum::{
-    routing::post,
-    Router,
     middleware,
 };
-use serde_json::Value;
-use snakes::feature_engineering::FeatureEngineeringHandler;
-use snakes::onehot::OneHotHandler;
-use snakes::{Snake, VersionedInput};
-use tracing::{error, info};
+use soap::dag_orchestrator::create_dag_router;
+use soap::snakes::{Snake, VersionedInput};
+use soap::versioned_modules::VersionedModules;
+use soap::watcher;
+use soap::
+    snakes::{
+        onehot::OneHotHandler,
+        feature_engineering::FeatureEngineeringHandler,
+    }
+;
+use tracing::{debug, error, info};
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,13 +32,9 @@ use std::convert::Infallible;
 use std::cell::Cell;
 use axum::http::StatusCode;
 use axum::body::HttpBody;
-
-mod watcher;
-
-mod versioned_modules;
-use versioned_modules::VersionedModules;
-
-mod snakes;
+use std::collections::HashMap;
+use soap::dag_orchestrator::{NodeInput, NodeOutput, InMemoryCache};
+use std::sync::OnceLock;
 
 thread_local! {
     static REQUEST_START: Cell<Option<Instant>> = Cell::new(None);
@@ -55,6 +54,7 @@ struct Args {
     num_interpreters: usize,
 }
 
+static VERSIONED_MODULES: OnceLock<Arc<VersionedModules>> = OnceLock::new();
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -81,113 +81,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.num_interpreters,
     )?);
 
+    // Set up the global VersionedModules
+    if VERSIONED_MODULES.set(versioned_modules.clone()).is_err() {
+        return Err("Failed to set global VersionedModules".into());
+    }
+
     // Set up file watcher
     watcher::spawn_file_watcher(
         scripts_dir.clone(),
         versioned_modules.clone(),
     )?;
 
-    // Define individual endpoints with proper handler signatures
-    async fn onehot_endpoint(
-        State(versioned_modules): State<Arc<VersionedModules>>,
-        input: Json<VersionedInput<Vec<String>>>,
-    ) -> Response {
-        OneHotHandler::handle(input, versioned_modules).await
-    }
+    // Create handlers map for DAG orchestrator
+    let mut handlers: HashMap<String, fn(NodeInput) -> NodeOutput> = HashMap::new();
 
-    async fn feature_engineering_endpoint(
-        State(versioned_modules): State<Arc<VersionedModules>>,
-        input: Json<VersionedInput<Vec<f64>>>,
-    ) -> Response {
-        FeatureEngineeringHandler::handle(input, versioned_modules).await
-    }
+    // Register handlers as plain functions
+    handlers.insert("onehot".to_string(), onehot_handler);
+    handlers.insert("feature_engineering".to_string(), feature_engineering_handler);
 
-    // You can compose endpoints! But then you have to handle the input and output types yourself.
-    // And with versions, you only choose the first input version...
-    // But you can do it!
-    // TODO: abstract even this function such that per request you could compose different endpoints...
-    async fn compose_endpoint(
-        State(versioned_modules): State<Arc<VersionedModules>>,
-        input: Json<VersionedInput<Vec<String>>>,
-    ) -> Response {
-        let onehot_response = onehot_endpoint(
-            State(Arc::clone(&versioned_modules)),
-            input,
-        ).await;
-        
-        // Check if onehot was successful
-        if !onehot_response.status().is_success() {
-            return onehot_response;
-        }
+    // Create cache for DAG orchestrator
+    let cache = Arc::new(InMemoryCache::new(300));
 
-        // Extract the body and parse it
-        let mut body = onehot_response.into_body();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = body.data().await {
-            match chunk {
-                Ok(chunk) => bytes.extend_from_slice(&chunk),
-                Err(e) => {
-                    error!("Failed to read response body: {}", e);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read intermediate result").into_response();
-                }
-            }
-        }
-
-        let onehot_json: Value = match serde_json::from_slice(&bytes) {
-            Ok(json) => json,
-            Err(e) => {
-                error!("Failed to parse onehot response: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse intermediate result").into_response();
-            }
-        };
-
-        // Convert onehot result to feature engineering input
-        let onehot_data = match onehot_json.get("result")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_array())
-                    .flat_map(|v| v.iter().filter_map(|x| x.as_f64()))
-                    .collect::<Vec<_>>()
-            })
-        {
-            Some(data) => data,
-            None => {
-                error!("Invalid onehot response format");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid intermediate result format").into_response();
-            }
-        };
-
-        feature_engineering_endpoint(
-            State(versioned_modules),
-            Json(VersionedInput {
-                data: onehot_data,
-                version: None,
-            }),
-        ).await
-    }
-
-    // Create the router with the endpoints
-    let app = Router::new()
-        .route("/onehot", post(onehot_endpoint))
-        .route("/feature_engineering", post(feature_engineering_endpoint))
-        .route("/compose", post(compose_endpoint))
+    // Create the router using just the DAG orchestrator
+    let app = create_dag_router(handlers, cache, true)
         .layer(middleware::from_fn(track_metrics))
         .layer(middleware::from_fn(set_request_start))
         .layer(
             ServiceBuilder::new()
-                // Handle errors from the buffer middleware
                 .layer(HandleErrorLayer::new(|error: BoxError| async move {
                     (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        StatusCode::SERVICE_UNAVAILABLE,
                         format!("Service is overloaded: {}", error),
                     )
                 }))
-                // Add a bounded buffer of 1024 requests
                 .buffer(REQUEST_BUFFER_SIZE)
                 .into_inner(),
-        )
-        .with_state(versioned_modules);
+        );
 
     // Start the server with graceful shutdown handling
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
@@ -256,7 +185,7 @@ pub async fn track_metrics(
     let processing_time = processing_start.elapsed();
 
     // Log detailed timing breakdown
-    info!(
+    debug!(
         "Request timing for {}:\n  \
          → Request creation to send: {:?}\n  \
          → Network transit time: {:?}\n  \
@@ -291,4 +220,118 @@ pub async fn set_request_start(
     });
 
     Ok(response)
+}
+
+// Create standalone functions instead of closures
+fn onehot_handler(input: NodeInput) -> NodeOutput {
+    let rt = tokio::runtime::Handle::current();
+
+    // Extract version from params if present
+    let version = input.params
+        .as_ref()
+        .and_then(|p| p.get("version"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let data = input.inputs.values()
+        .next()
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+        .expect("Expected Vec<String> input");
+
+    let result = rt.block_on(OneHotHandler::handle(
+        Json(VersionedInput { data, version }),  // Pass through the version
+        VERSIONED_MODULES.get().unwrap().clone()
+    ));
+
+    // Add debug logging here
+    debug!("OneHotHandler result: {:?}", result);
+
+    // Response handling
+    let body_bytes = rt.block_on(async {
+        if let Some(data) = result.into_response().into_body().data().await {
+            data.ok()
+        } else {
+            None
+        }
+    });
+
+    // Add debug logging here too
+    debug!("Body bytes: {:?}", body_bytes);
+
+    match body_bytes {
+        Some(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(value) => NodeOutput {
+                value,
+                error: None,
+            },
+            Err(e) => NodeOutput {
+                value: serde_json::Value::Null,
+                error: Some(e.to_string()),
+            },
+        },
+        None => NodeOutput {
+            value: serde_json::Value::Null,
+            error: Some("Failed to get response data".to_string()),
+        },
+    }
+}
+
+// Similar function for feature_engineering_handler
+fn feature_engineering_handler(input: NodeInput) -> NodeOutput {
+    let rt = tokio::runtime::Handle::current();
+
+    let version = input.params
+        .as_ref()
+        .and_then(|p| p.get("version"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // Extract the result array from the onehot output
+    let data = input.inputs.values()
+        .next()
+        .and_then(|v| v.get("result"))  // Extract the "result" field
+        .and_then(|arr| arr.as_array())  // Get as array
+        .map(|arrays| {
+            // Flatten the 2D array into a 1D array of f64s
+            arrays.iter()
+                .flat_map(|inner| {
+                    inner.as_array()
+                        .map(|arr| arr.to_vec())
+                        .unwrap_or_default()
+                })
+                .filter_map(|v| v.as_f64())
+                .collect::<Vec<f64>>()
+        })
+        .expect("Expected 2D array input from onehot encoder");
+
+    let result = rt.block_on(FeatureEngineeringHandler::handle(
+        Json(VersionedInput { data, version }),
+        VERSIONED_MODULES.get().unwrap().clone()
+    ));
+
+    // Response handling
+    let body_bytes = rt.block_on(async {
+        if let Some(data) = result.into_response().into_body().data().await {
+            data.ok()
+        } else {
+            None
+        }
+    });
+
+    match body_bytes {
+        Some(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(value) => NodeOutput {
+                value,
+                error: None,
+            },
+            Err(e) => NodeOutput {
+                value: serde_json::Value::Null,
+                error: Some(e.to_string()),
+            },
+        },
+        None => NodeOutput {
+            value: serde_json::Value::Null,
+            error: Some("Failed to get response data".to_string()),
+        },
+    }
 }

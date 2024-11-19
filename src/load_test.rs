@@ -20,7 +20,7 @@ struct Args {
     duration_secs: u64,
 
     /// Server URL
-    #[arg(long, env = "SERVER_URL", default_value = "http://127.0.0.1:3000/onehot")]
+    #[arg(long, env = "SERVER_URL", default_value = "http://127.0.0.1:3000/endpoint/onehot")]
     server_url: String,
 }
 
@@ -80,8 +80,12 @@ async fn main() {
             // Time JSON preparation
             let json_start = Instant::now();
             let request_payload = serde_json::json!({
-                "data": &*categories,
-                "version": "1.0.0"
+                "inputs": {
+                    "data": &*categories
+                },
+                "params": {
+                    "version": "1.0.0"
+                }
             });
             let json_time = json_start.elapsed().as_millis() as u64;
 

@@ -18,18 +18,18 @@ use uuid::Uuid;
 // Node input/output
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInput {
-    inputs: HashMap<String, serde_json::Value>, // source_node -> output_value
-    params: Option<serde_json::Value>,
+    pub inputs: HashMap<String, serde_json::Value>, // source_node -> output_value
+    pub params: Option<serde_json::Value>,
     #[serde(default)]
-    cache_output: Option<bool>,
+    pub cache_output: Option<bool>,
     #[serde(default)]
-    use_cached_inputs: Option<bool>,
+    pub use_cached_inputs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeOutput {
-    value: serde_json::Value,
-    error: Option<String>,
+    pub value: serde_json::Value,
+    pub error: Option<String>,
 }
 
 // Cache trait for flexibility
@@ -41,13 +41,13 @@ pub trait Cache: Send + Sync {
 
 // Simple in-memory implementation
 #[derive(Clone)]
-struct InMemoryCache {
+pub struct InMemoryCache {
     store: Arc<DashMap<String, (NodeOutput, SystemTime)>>,
     ttl: Duration,
 }
 
 impl InMemoryCache {
-    fn new(ttl_seconds: u64) -> Self {
+    pub fn new(ttl_seconds: u64) -> Self {
         Self {
             store: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(ttl_seconds),
@@ -174,12 +174,14 @@ impl Orchestrator {
 
         // Use get_dependencies() to get actual dependencies (filtering out cached ones)
         let dependencies = Orchestrator::get_dependencies(config);
+        debug!("DAG Dependencies: {:?}", dependencies);
         let mut resolved = HashSet::new();
 
         // Start with external inputs
         if let Some(inputs) = &config.inputs {
             resolved.extend(inputs.keys().cloned());
         }
+        debug!("Resolved inputs: {:?}", resolved);
 
         // Keep resolving until we can't anymore
         loop {
@@ -190,6 +192,7 @@ impl Orchestrator {
                 })
                 .map(|(node, _)| node.clone())
                 .collect::<Vec<_>>();
+            debug!("Resolvable nodes: {:?}", resolvable);
 
             if resolvable.is_empty() {
                 break;
@@ -203,6 +206,7 @@ impl Orchestrator {
             .keys()
             .filter(|node| !resolved.contains(*node))
             .collect();
+        debug!("Unresolved nodes: {:?}", unresolved);
 
         if !unresolved.is_empty() {
             return Err(format!("Cycle detected among nodes: {:?}", unresolved));
@@ -229,6 +233,8 @@ impl Orchestrator {
             .request_id
             .take()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        debug!("Request ID: {}", request_id);
+
         let mut completed = HashSet::new();
         let mut results: HashMap<String, NodeOutput> = HashMap::new();
 
@@ -242,9 +248,9 @@ impl Orchestrator {
                         error: None,
                     },
                 );
-                completed.insert(node.clone());
             }
         }
+        debug!("Preloaded completed inputs: {:?}", completed);
 
         while completed.len() < config.nodes.len() {
             let to_execute: Vec<_> = config
@@ -263,11 +269,13 @@ impl Orchestrator {
                 })
                 .map(|(node, def)| (node.clone(), def.clone()))
                 .collect();
+            debug!("Nodes to execute: {:?}", to_execute);
 
             if to_execute.is_empty() && completed.len() < config.nodes.len() {
                 return Err("Unable to make progress - possible cycle".to_string());
             }
 
+            debug!("Executing nodes in parallel");
             // Execute nodes in parallel
             let mut handles = Vec::new();
             for (node, def) in to_execute {
@@ -327,6 +335,7 @@ impl Orchestrator {
         } else {
             results
         };
+        debug!("Final results: {:?}", outputs);
 
         Ok((request_id, outputs))
     }
@@ -361,6 +370,15 @@ impl Orchestrator {
     ) -> Result<HashMap<String, serde_json::Value>, String> {
         let mut inputs = HashMap::new();
 
+        // If node has no dependencies but there are external inputs, use them directly
+        if def.depends_on.is_empty() {
+            if let Some(external_inputs) = &config.inputs {
+                inputs.extend(external_inputs.clone());
+                return Ok(inputs);
+            }
+        }
+
+        // Original dependency handling logic
         for dep in &def.depends_on {
             let value = if def.use_cached_inputs.unwrap_or(false) {
                 // Try cache first if use_cached_inputs is true
@@ -370,8 +388,10 @@ impl Orchestrator {
                 // Check if the dependency was configured to cache its output
                 if let Some(dep_def) = config.nodes.get(dep) {
                     if dep_def.cache_output == Some(false) {
-                        return Err(format!("Node {} requires cached input from {}, but {} has caching disabled",
-                            def.depends_on[0], dep, dep));
+                        return Err(format!(
+                            "Node {} requires cached input from {}, but {} has caching disabled",
+                            def.depends_on[0], dep, dep
+                        ));
                     }
                 }
 
@@ -419,176 +439,6 @@ impl Orchestrator {
     }
 }
 
-// Handlers for individual endpoints
-fn handler_a(input: NodeInput) -> NodeOutput {
-    let base_value = 2; // Keep this at 2 to match tests
-
-    // Check if we should return a string
-    if let Some(ref params) = input.params {
-        if let Some(return_string) = params.get("return_string") {
-            if return_string.as_bool().unwrap_or(false) {
-                return NodeOutput {
-                    value: serde_json::json!("string_value"),
-                    error: None,
-                };
-            }
-        }
-    }
-
-    // Apply multiplier if present
-    let value = if let Some(ref params) = input.params {
-        if let Some(multiplier) = params.get("multiplier") {
-            if let Some(m) = multiplier.as_f64() {
-                (base_value as f64 * m) as i64
-            } else {
-                return NodeOutput {
-                    value: serde_json::Value::Null,
-                    error: Some("invalid parameter type: multiplier must be a number".to_string()),
-                };
-            }
-        } else {
-            base_value
-        }
-    } else {
-        base_value
-    };
-
-    NodeOutput {
-        value: serde_json::json!(value),
-        error: None,
-    }
-}
-
-fn handler_b(input: NodeInput) -> NodeOutput {
-    // First check if we should return a string (for testing error propagation)
-    if let Some(ref params) = input.params {
-        if let Some(return_string) = params.get("return_string") {
-            if return_string.as_bool().unwrap_or(false) {
-                return NodeOutput {
-                    value: serde_json::json!("string_value"),
-                    error: None,
-                };
-            }
-        }
-    }
-
-    let multiplier = input
-        .params
-        .as_ref()
-        .and_then(|obj| obj.get("multiplier"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(2.0);
-
-    // Check if any input is non-numeric
-    if input.inputs.values().any(|v| !v.is_number()) {
-        return NodeOutput {
-            value: serde_json::Value::Null,
-            error: Some("expects numeric input".to_string()),
-        };
-    }
-
-    // Get input value and ensure it's numeric
-    let input_value = match input
-        .inputs
-        .values()
-        .next()
-        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
-    {
-        Some(val) => val,
-        None => {
-            return NodeOutput {
-                value: serde_json::Value::Null,
-                error: Some("expects numeric input".to_string()),
-            }
-        }
-    };
-
-    NodeOutput {
-        value: serde_json::json!((input_value * multiplier) as i64),
-        error: None,
-    }
-}
-
-fn handler_c(input: NodeInput) -> NodeOutput {
-    // C expects exactly one input
-    if input.inputs.len() > 1 {
-        return NodeOutput {
-            value: serde_json::Value::Null,
-            error: Some(format!(
-                "Node C expects single input, got {}",
-                input.inputs.len()
-            )),
-        };
-    }
-
-    let value = if input.inputs.is_empty() {
-        4 // Default value if no input
-    } else {
-        let (_, input_value) = input.inputs.iter().next().unwrap();
-        match input_value.as_i64() {
-            Some(num) => num + 5,
-            None => {
-                return NodeOutput {
-                    value: serde_json::Value::Null,
-                    error: Some(format!(
-                        "Node C expects numeric input, got: {}",
-                        input_value
-                    )),
-                }
-            }
-        }
-    };
-
-    NodeOutput {
-        value: serde_json::json!(value),
-        error: None,
-    }
-}
-
-fn handler_d(input: NodeInput) -> NodeOutput {
-    // Verify all inputs are numeric
-    for (name, value) in &input.inputs {
-        if !value.is_number() {
-            return NodeOutput {
-                value: serde_json::Value::Null,
-                error: Some(format!(
-                    "expects numeric input, got {} from {}",
-                    value, name
-                )),
-            };
-        }
-    }
-
-    // D multiplies all inputs together
-    if input.inputs.is_empty() {
-        return NodeOutput {
-            value: serde_json::json!(1), // Identity for multiplication
-            error: None,
-        };
-    }
-
-    let mut result = 1;
-    for (source_node, value) in input.inputs {
-        match value.as_i64() {
-            Some(num) => result *= num,
-            None => {
-                return NodeOutput {
-                    value: serde_json::Value::Null,
-                    error: Some(format!(
-                        "expects numeric input, got {} from {}",
-                        value, source_node
-                    )),
-                }
-            }
-        }
-    }
-
-    NodeOutput {
-        value: serde_json::json!(result),
-        error: None,
-    }
-}
-
 // HTTP handler for individual endpoints
 async fn endpoint_handler(
     State(orchestrator): State<Orchestrator>,
@@ -604,7 +454,7 @@ async fn endpoint_handler(
             nodes.insert(
                 name.clone(),
                 NodeDefinition {
-                    depends_on: input.inputs.keys().cloned().collect(),
+                    depends_on: vec![],
                     cache_output: input.cache_output,
                     use_cached_inputs: input.use_cached_inputs,
                     params: input.params.clone(),
@@ -668,7 +518,8 @@ async fn validate_handler(
     }
 }
 
-pub fn router(
+/// Creates endpoint per node, composition endpoint, and validation endpoint
+pub fn create_dag_router(
     handlers: HashMap<String, fn(NodeInput) -> NodeOutput>,
     cache: Arc<dyn Cache>,
     cache_enabled: bool,
@@ -712,36 +563,184 @@ fn generate_cache_key(
     format!("node_{}_{:x}", node, hasher.finish())
 }
 
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
-
-    let mut handlers: HashMap<String, fn(NodeInput) -> NodeOutput> = HashMap::new();
-    handlers.insert("A".to_string(), handler_a as fn(NodeInput) -> NodeOutput);
-    handlers.insert("B".to_string(), handler_b as fn(NodeInput) -> NodeOutput);
-    handlers.insert("C".to_string(), handler_c as fn(NodeInput) -> NodeOutput);
-    handlers.insert("D".to_string(), handler_d as fn(NodeInput) -> NodeOutput);
-
-    let cache = Arc::new(InMemoryCache::new(300)); // 5 minute TTL
-
-    let app = router(handlers, cache, true);
-
-    info!("Server running on http://localhost:3000");
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
-}
-
-
 #[cfg(test)]
 mod tests {
     use axum::body::HttpBody;
 
     use super::*;
     use std::sync::Arc;
+
+    // Handlers for individual endpoints
+    fn handler_a(input: NodeInput) -> NodeOutput {
+        let base_value = 2; // Keep this at 2 to match tests
+
+        // Check if we should return a string
+        if let Some(ref params) = input.params {
+            if let Some(return_string) = params.get("return_string") {
+                if return_string.as_bool().unwrap_or(false) {
+                    return NodeOutput {
+                        value: serde_json::json!("string_value"),
+                        error: None,
+                    };
+                }
+            }
+        }
+
+        // Apply multiplier if present
+        let value = if let Some(ref params) = input.params {
+            if let Some(multiplier) = params.get("multiplier") {
+                if let Some(m) = multiplier.as_f64() {
+                    (base_value as f64 * m) as i64
+                } else {
+                    return NodeOutput {
+                        value: serde_json::Value::Null,
+                        error: Some(
+                            "invalid parameter type: multiplier must be a number".to_string(),
+                        ),
+                    };
+                }
+            } else {
+                base_value
+            }
+        } else {
+            base_value
+        };
+
+        NodeOutput {
+            value: serde_json::json!(value),
+            error: None,
+        }
+    }
+
+    fn handler_b(input: NodeInput) -> NodeOutput {
+        // First check if we should return a string (for testing error propagation)
+        if let Some(ref params) = input.params {
+            if let Some(return_string) = params.get("return_string") {
+                if return_string.as_bool().unwrap_or(false) {
+                    return NodeOutput {
+                        value: serde_json::json!("string_value"),
+                        error: None,
+                    };
+                }
+            }
+        }
+
+        let multiplier = input
+            .params
+            .as_ref()
+            .and_then(|obj| obj.get("multiplier"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(2.0);
+
+        // Check if any input is non-numeric
+        if input.inputs.values().any(|v| !v.is_number()) {
+            return NodeOutput {
+                value: serde_json::Value::Null,
+                error: Some("expects numeric input".to_string()),
+            };
+        }
+
+        // Get input value and ensure it's numeric
+        let input_value = match input
+            .inputs
+            .values()
+            .next()
+            .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
+        {
+            Some(val) => val,
+            None => {
+                return NodeOutput {
+                    value: serde_json::Value::Null,
+                    error: Some("expects numeric input".to_string()),
+                }
+            }
+        };
+
+        NodeOutput {
+            value: serde_json::json!((input_value * multiplier) as i64),
+            error: None,
+        }
+    }
+
+    fn handler_c(input: NodeInput) -> NodeOutput {
+        // C expects exactly one input
+        if input.inputs.len() > 1 {
+            return NodeOutput {
+                value: serde_json::Value::Null,
+                error: Some(format!(
+                    "Node C expects single input, got {}",
+                    input.inputs.len()
+                )),
+            };
+        }
+
+        let value = if input.inputs.is_empty() {
+            4 // Default value if no input
+        } else {
+            let (_, input_value) = input.inputs.iter().next().unwrap();
+            match input_value.as_i64() {
+                Some(num) => num + 5,
+                None => {
+                    return NodeOutput {
+                        value: serde_json::Value::Null,
+                        error: Some(format!(
+                            "Node C expects numeric input, got: {}",
+                            input_value
+                        )),
+                    }
+                }
+            }
+        };
+
+        NodeOutput {
+            value: serde_json::json!(value),
+            error: None,
+        }
+    }
+
+    fn handler_d(input: NodeInput) -> NodeOutput {
+        // Verify all inputs are numeric
+        for (name, value) in &input.inputs {
+            if !value.is_number() {
+                return NodeOutput {
+                    value: serde_json::Value::Null,
+                    error: Some(format!(
+                        "expects numeric input, got {} from {}",
+                        value, name
+                    )),
+                };
+            }
+        }
+
+        // D multiplies all inputs together
+        if input.inputs.is_empty() {
+            return NodeOutput {
+                value: serde_json::json!(1), // Identity for multiplication
+                error: None,
+            };
+        }
+
+        let mut result = 1;
+        for (source_node, value) in input.inputs {
+            match value.as_i64() {
+                Some(num) => result *= num,
+                None => {
+                    return NodeOutput {
+                        value: serde_json::Value::Null,
+                        error: Some(format!(
+                            "expects numeric input, got {} from {}",
+                            value, source_node
+                        )),
+                    }
+                }
+            }
+        }
+
+        NodeOutput {
+            value: serde_json::json!(result),
+            error: None,
+        }
+    }
 
     struct MockCache {
         data: Arc<Mutex<HashMap<String, NodeOutput>>>,

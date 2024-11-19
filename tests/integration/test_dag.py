@@ -3,7 +3,7 @@ import requests
 import pytest
 
 class DagTester:
-    def __init__(self, base_url="http://localhost:3000"):
+    def __init__(self, base_url="http://localhost:3039"):
         self.base_url = base_url
 
     def execute_dag(self, nodes=None, request_id=None, output_nodes=None, inputs=None):
