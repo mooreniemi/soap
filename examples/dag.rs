@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 // Node input/output
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct NodeInput {
+pub struct NodeInput {
     inputs: HashMap<String, serde_json::Value>, // source_node -> output_value
     params: Option<serde_json::Value>,
     #[serde(default)]
@@ -27,13 +27,13 @@ struct NodeInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct NodeOutput {
+pub struct NodeOutput {
     value: serde_json::Value,
     error: Option<String>,
 }
 
 // Cache trait for flexibility
-trait Cache: Send + Sync {
+pub trait Cache: Send + Sync {
     fn get(&self, key: &str) -> Option<NodeOutput>;
     fn put(&self, key: &str, value: NodeOutput);
     fn invalidate(&self, key: &str);
@@ -364,7 +364,7 @@ impl Orchestrator {
         for dep in &def.depends_on {
             let value = if def.use_cached_inputs.unwrap_or(false) {
                 // Try cache first if use_cached_inputs is true
-                let dep_inputs = self.collect_dependency_inputs(dep, def, config);
+                let dep_inputs = self.collect_dependency_inputs(def, config);
                 let cache_key = generate_cache_key(dep, &dep_inputs, &None);
 
                 // Check if the dependency was configured to cache its output
@@ -401,7 +401,6 @@ impl Orchestrator {
 
     fn collect_dependency_inputs(
         &self,
-        _node: &str,
         def: &NodeDefinition,
         config: &DagConfig,
     ) -> HashMap<String, serde_json::Value> {
@@ -669,15 +668,17 @@ async fn validate_handler(
     }
 }
 
-pub fn router() -> Router {
-    let cache = InMemoryCache::new(300); // 5 minute TTL
-    let orchestrator = Orchestrator::new(Arc::new(cache), true);
+pub fn router(
+    handlers: HashMap<String, fn(NodeInput) -> NodeOutput>,
+    cache: Arc<dyn Cache>,
+    cache_enabled: bool,
+) -> Router {
+    let orchestrator = Orchestrator::new(cache, cache_enabled);
 
     // Register handlers
-    orchestrator.register_endpoint("A".to_string(), handler_a);
-    orchestrator.register_endpoint("B".to_string(), handler_b);
-    orchestrator.register_endpoint("C".to_string(), handler_c);
-    orchestrator.register_endpoint("D".to_string(), handler_d);
+    for (name, handler) in handlers {
+        orchestrator.register_endpoint(name, handler);
+    }
 
     Router::new()
         .route("/compose", post(compose_handler))
@@ -687,19 +688,6 @@ pub fn router() -> Router {
             post(|state, path, body| endpoint_handler(state, path, body)),
         )
         .with_state(orchestrator)
-}
-
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
-
-    info!("Server running on http://localhost:3000");
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
-        .serve(router().into_make_service())
-        .await
-        .unwrap();
 }
 
 fn generate_cache_key(
@@ -723,6 +711,30 @@ fn generate_cache_key(
 
     format!("node_{}_{:x}", node, hasher.finish())
 }
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
+
+    let mut handlers: HashMap<String, fn(NodeInput) -> NodeOutput> = HashMap::new();
+    handlers.insert("A".to_string(), handler_a as fn(NodeInput) -> NodeOutput);
+    handlers.insert("B".to_string(), handler_b as fn(NodeInput) -> NodeOutput);
+    handlers.insert("C".to_string(), handler_c as fn(NodeInput) -> NodeOutput);
+    handlers.insert("D".to_string(), handler_d as fn(NodeInput) -> NodeOutput);
+
+    let cache = Arc::new(InMemoryCache::new(300)); // 5 minute TTL
+
+    let app = router(handlers, cache, true);
+
+    info!("Server running on http://localhost:3000");
+    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+}
+
 
 #[cfg(test)]
 mod tests {
