@@ -21,18 +21,18 @@ integration-test: setup-test-deps kill-test-server
 	@echo "Waiting for server to start..."
 	@sleep 2
 	@echo "Running tests..."
-	@python3 -m pytest integration/dag_tester.py -v
+	@python3 -m pytest tests/integration/test_dag.py -v
 	@echo "Cleaning up..."
 	@$(MAKE) kill-test-server
 
 # Install Python dependencies (for integration tests)
 setup-test-deps:
-	pip install -r integration/requirements.txt
+	pip3 install -r tests/integration/requirements.txt --break-system-packages
 
 # Run the main server with proper configuration
 server:
 	@echo "Starting main server..."
-	RUST_LOG=debug \
+	RUST_LOG=soap=debug,hyper=off \
 	SCRIPTS_DIR=$(shell pwd)/scripts \
 	NUM_INTERPRETERS=4 \
 	cargo run --release --bin soap

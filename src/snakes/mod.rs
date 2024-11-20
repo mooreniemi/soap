@@ -121,7 +121,7 @@ pub trait Snake {
     type InputData;
 
     /// The name of the script to use
-    /// Will error if this script does not exist
+    /// Will error if the script does not exist
     fn script_name() -> &'static str;
 
     /// The name of the function to use inside the script

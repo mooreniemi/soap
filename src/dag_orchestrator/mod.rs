@@ -7,7 +7,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
+use std::{collections::hash_map::DefaultHasher, time::Instant};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
@@ -106,7 +106,7 @@ struct DagConfig {
 // Shared state for the orchestrator
 #[derive(Clone)]
 struct Orchestrator {
-    endpoints: Arc<Mutex<HashMap<String, fn(NodeInput) -> NodeOutput>>>,
+    endpoints: Arc<DashMap<String, fn(NodeInput) -> NodeOutput>>,
     cache: Arc<dyn Cache>,
     cache_enabled: bool,
 }
@@ -114,15 +114,14 @@ struct Orchestrator {
 impl Orchestrator {
     fn new(cache: Arc<dyn Cache>, cache_enabled: bool) -> Self {
         Self {
-            endpoints: Arc::new(Mutex::new(HashMap::new())),
+            endpoints: Arc::new(DashMap::new()),
             cache,
             cache_enabled,
         }
     }
 
     fn register_endpoint(&self, name: String, handler: fn(NodeInput) -> NodeOutput) {
-        let mut endpoints = self.endpoints.lock().unwrap();
-        endpoints.insert(name, handler);
+        self.endpoints.insert(name, handler);
     }
 
     // Helper to convert new config format to dependencies map
@@ -227,7 +226,10 @@ impl Orchestrator {
         mut config: DagConfig,
     ) -> Result<(String, HashMap<String, NodeOutput>), String> {
         debug!("Starting DAG execution");
+        let start_time = Instant::now();
         self.validate(&config)?;
+        let validation_duration = Instant::now().duration_since(start_time);
+        debug!("DAG validation took {:?}", validation_duration);
 
         let request_id = config
             .request_id
@@ -238,6 +240,7 @@ impl Orchestrator {
         let mut completed = HashSet::new();
         let mut results: HashMap<String, NodeOutput> = HashMap::new();
 
+        let start_time = Instant::now();
         // First, add all external inputs to results
         if let Some(inputs) = &config.inputs {
             for (node, value) in inputs {
@@ -250,7 +253,8 @@ impl Orchestrator {
                 );
             }
         }
-        debug!("Preloaded completed inputs: {:?}", completed);
+        let preload_duration = Instant::now().duration_since(start_time);
+        debug!("Preloaded completed inputs in {:?}", preload_duration);
 
         while completed.len() < config.nodes.len() {
             let to_execute: Vec<_> = config
@@ -290,8 +294,7 @@ impl Orchestrator {
                     let inputs = orchestrator.collect_node_inputs(&def, &results, &config)?;
 
                     // Execute the node
-                    let endpoints_guard = endpoints.lock().map_err(|e| e.to_string())?;
-                    let handler = endpoints_guard
+                    let handler = endpoints
                         .get(&node)
                         .ok_or_else(|| format!("No handler for node {}", node))?;
 
