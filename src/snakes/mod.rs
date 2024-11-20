@@ -10,6 +10,25 @@ use std::time::{Instant, Duration};
 use tracing::debug;
 use axum::response::Response;
 
+
+/// Trait for snake handlers that process Python-based transformations
+pub trait Snake {
+    type InputData;
+
+    /// The name of the script to use
+    /// Will error if the script does not exist
+    fn script_name() -> &'static str;
+
+    /// The name of the function to use inside the script
+    /// Will error if this function does not exist
+    fn function_name() -> &'static str;
+
+    async fn handle(
+        input: Json<VersionedInput<Self::InputData>>,
+        versioned_modules: Arc<VersionedModules>,
+    ) -> Response;
+}
+
 // Common input structure that all snakes share
 #[derive(Deserialize)]
 pub struct VersionedInput<T> {
@@ -116,20 +135,105 @@ impl Metrics {
     }
 }
 
-/// Trait for snake handlers that process Python-based transformations
-pub trait Snake {
-    type InputData;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
 
-    /// The name of the script to use
-    /// Will error if the script does not exist
-    fn script_name() -> &'static str;
+    #[test]
+    fn test_metrics_total_duration() {
+        let metrics = Metrics::new();
+        thread::sleep(Duration::from_millis(10));
+        let total = metrics.total_start.elapsed();
+        assert!(total >= Duration::from_millis(10));
+    }
 
-    /// The name of the function to use inside the script
-    /// Will error if this function does not exist
-    fn function_name() -> &'static str;
+    #[test]
+    fn test_metrics_lock_timing() {
+        let mut metrics = Metrics::new();
 
-    async fn handle(
-        input: Json<VersionedInput<Self::InputData>>,
-        versioned_modules: Arc<VersionedModules>,
-    ) -> Response;
+        // Start lock timing
+        metrics.start_lock();
+        thread::sleep(Duration::from_millis(10));
+        metrics.end_lock();
+
+        assert!(metrics.lock_duration.is_some());
+        assert!(metrics.lock_duration.unwrap() >= Duration::from_millis(10));
+
+        // Lock duration should not change after ending
+        let first_duration = metrics.lock_duration.unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(metrics.lock_duration.unwrap(), first_duration);
+    }
+
+    #[test]
+    fn test_metrics_gil_timing() {
+        let mut metrics = Metrics::new();
+
+        // Start GIL timing
+        metrics.start_gil();
+        thread::sleep(Duration::from_millis(10));
+        metrics.end_gil();
+
+        assert!(metrics.gil_duration.is_some());
+        assert!(metrics.gil_duration.unwrap() >= Duration::from_millis(10));
+
+        // GIL duration should not change after ending
+        let first_duration = metrics.gil_duration.unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(metrics.gil_duration.unwrap(), first_duration);
+    }
+
+    #[test]
+    fn test_metrics_multiple_operations() {
+        let mut metrics = Metrics::new();
+
+        // First operation
+        metrics.start_lock();
+        thread::sleep(Duration::from_millis(10));
+        metrics.end_lock();
+        let first_lock = metrics.lock_duration.unwrap();
+
+        // Second operation
+        metrics.start_lock();
+        thread::sleep(Duration::from_millis(20));
+        metrics.end_lock();
+        let second_lock = metrics.lock_duration.unwrap();
+
+        // Second duration should be longer
+        assert!(second_lock > first_lock);
+    }
+
+    #[test]
+    fn test_metrics_build_response() {
+        let mut metrics = Metrics::new();
+
+        // Simulate some operations
+        metrics.start_lock();
+        thread::sleep(Duration::from_millis(10));
+        metrics.end_lock();
+
+        metrics.start_gil();
+        thread::sleep(Duration::from_millis(20));
+        metrics.end_gil();
+
+        let response = metrics.build_response(
+            "test_result",
+            (Some("1.0.0".to_string()), "2.0.0".to_string())
+        );
+
+        let metrics_obj = response.get("metrics").unwrap();
+        assert!(metrics_obj.get("lock_duration_ms").unwrap().as_u64().unwrap() >= 10);
+        assert!(metrics_obj.get("gil_duration_ms").unwrap().as_u64().unwrap() >= 20);
+        assert!(metrics_obj.get("total_duration_ms").unwrap().as_u64().unwrap() >= 30);
+
+        assert_eq!(
+            response.get("version").unwrap().get("requested").unwrap(),
+            "1.0.0"
+        );
+        assert_eq!(
+            response.get("version").unwrap().get("actual").unwrap(),
+            "2.0.0"
+        );
+    }
 }
