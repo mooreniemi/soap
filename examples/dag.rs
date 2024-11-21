@@ -323,7 +323,7 @@ impl ComponentsExecutorManager {
                     }
 
                     // Get inputs for this component
-                    let component_input = if let Some(deps) = node.dependencies.first() {
+                    let component_input: BaseComponentInput = if let Some(deps) = node.dependencies.first() {
                         cache.get_current(deps).await
                             .ok_or_else(|| ComponentError::DependencyFailed(deps.clone()))?
                             .into()
@@ -333,6 +333,14 @@ impl ComponentsExecutorManager {
                             .map(Into::into)
                             .unwrap_or_default()
                     };
+
+                    // Add validation here, before spawning the task
+                    if let Err(e) = component_input.validate() {
+                        return Err(ComponentError::ExecutionError(format!(
+                            "Input validation failed for {:#?}: {}",
+                            component_enum, e
+                        )));
+                    }
 
                     // Clone what we need for the spawned task
                     let component_enum = component_enum.clone();
@@ -353,6 +361,12 @@ impl ComponentsExecutorManager {
 
                         match component.execute(component_input, context).await {
                             Ok(output) => {
+                                // If we didn't produce the keys we promised, we don't store anything
+                                if let Err(e) = output.validate() {
+                                    println!("❌ Component output validation failed: {}", e);
+                                    return Err(ComponentError::ExecutionError(e.to_string()));
+                                }
+
                                 println!("✅ Component {:?} completed successfully", component.name());
                                 cache.store_current(component_enum.clone(), output.clone()).await;
                                 cache.store_history(component_enum.clone(), output.clone()).await;
@@ -475,33 +489,19 @@ impl AsyncComponent for ExampleComponent {
         let produced_keys = self.get_produced_keys();
 
         Box::pin(async move {
-            // Validate input
-            input.validate()?;
-
             let start = Instant::now();
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
             let output = BaseComponentOutput {
                 state: CompletionState::Success,
                 cacheable_data: json!({
+                    "instance_name": instance_name,
                     "processed_data": input.cacheable_data["input_data"],
                     "processing_time": start.elapsed().as_millis()
                 }),
                 context: context.clone(),
                 produced_keys: produced_keys.clone(),
             };
-
-            // Validate output
-            if let Err(e) = output.validate() {
-                return Ok(BaseComponentOutput {
-                    state: CompletionState::Failure,
-                    cacheable_data: json!({
-                        "error": e.to_string()
-                    }),
-                    context,
-                    produced_keys: vec![],  // Failed to produce any keys
-                });
-            }
 
             Ok(output)
         })
@@ -581,7 +581,7 @@ impl AsyncComponent for ValidationComponent {
     ) -> BoxFuture<'static, Result<BaseComponentOutput, String>> {
         Box::pin(async move {
             let start = Instant::now();
-            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             // NOTE: simulate random failure to make sure that we can handle it
             let result = if rand::random::<bool>() {
                 println!("❌ ValidationComponent failed after {:?}", start.elapsed());
@@ -590,7 +590,7 @@ impl AsyncComponent for ValidationComponent {
                 println!("⚙️  ValidationComponent processing took {:?}", start.elapsed());
                 Ok(BaseComponentOutput {
                     state: CompletionState::Success,
-                    cacheable_data: json!({}),
+                    cacheable_data: json!({"validation_result": true}),
                     context,
                     produced_keys: vec!["validation_result".to_string()],
                 })
@@ -625,7 +625,7 @@ impl AsyncComponent for AggregatorComponent {
     ) -> BoxFuture<'static, Result<BaseComponentOutput, String>> {
         Box::pin(async move {
             let start = Instant::now();
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             println!("⚙️  AggregatorComponent processing took {:?}", start.elapsed());
             Ok(BaseComponentOutput {
                 state: CompletionState::Success,
@@ -742,7 +742,7 @@ impl ComponentCache {
         if let HistoryStorage::File(path) = &self.storage_config {
             println!("📖 Loading history from {}", path.display());
             let contents = tokio::fs::read_to_string(path).await?;
-            println!("📖 Read {} bytes from file", contents.len());
+            println!(" Read {} bytes from file", contents.len());
             let mut history = self.history.lock().await;
 
             for line in contents.lines() {
@@ -778,6 +778,7 @@ impl From<BaseComponentOutput> for BaseComponentInput {
         BaseComponentInput {
             cacheable_data: output.cacheable_data,
             context: output.context,
+            // NOTE: this is a little overly strict, you'd probably want to just sub-select some
             consumed_keys: output.produced_keys,
         }
     }
@@ -816,7 +817,6 @@ impl Default for HistorySource {
     }
 }
 
-// Make validation methods take owned values
 impl BaseComponentInput {
     fn validate(&self) -> Result<(), String> {
         let data = self.cacheable_data.as_object()
