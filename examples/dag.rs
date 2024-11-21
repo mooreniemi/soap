@@ -96,8 +96,8 @@ impl Default for CacheConfig {
                 use_history: None,
             },
             history: HistoryCacheConfig {
-                store_output: true,  // Always store by default
-                storage: HistoryStorage::default(),  // This will use File storage by default
+                store_output: true,
+                storage: HistoryStorage::default(),
                 load_from_history: false,
             },
         }
@@ -274,9 +274,13 @@ impl ComponentsExecutorManager {
                     let node = component_nodes.get(component_enum)
                         .ok_or_else(|| ComponentError::ComponentNotFound(component_enum.clone()))?;
 
-                    // Check history requirements - only use if specifically configured for this node
+                    // Check history requirements - use node config or fall back to global
                     let use_history = node.cache_config.current.use_history
-                        .as_ref()  // Only use node config, don't fall back to global
+                        .as_ref()
+                        .or_else(|| {
+                            println!("ℹ️ No node-specific history config for {:#?}, using global", component_enum);
+                            self.global_cache_config.current.use_history.as_ref()
+                        })
                         .map(|h| h.clone());
 
                     if let Some(history_source) = use_history {
@@ -894,8 +898,10 @@ async fn main() {
             },
             "cache": {
                 "current": {
-                    "cache_output": true,
-                    "use_cached": true,
+                    // when using history, we could populate the output cache...
+                    //"cache_output": true,
+                    // when using history, we don't want to use the cache
+                    //"use_cached": true,
                     "use_history": {
                         "request_id": specific_request.to_string(),
                         "strict": true  // Fail if this history isn't found
@@ -967,10 +973,7 @@ async fn main() {
             current: CurrentCacheConfig {
                 cache_output: true,
                 use_cached: true,
-                use_history: Some(HistorySource {
-                    request_id: specific_request,
-                    strict: true,
-                }),
+                use_history: None,
             },
             history: HistoryCacheConfig {
                 store_output: true,
@@ -978,7 +981,7 @@ async fn main() {
                 load_from_history: true,
             },
         }),
-        None,  // Use default storage from config
+        None,
     ).await;
     let inputs = HashMap::new();
     let request_id = Uuid::new_v4();
