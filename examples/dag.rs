@@ -1,13 +1,12 @@
 use std::collections::{HashMap, BTreeMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use futures::future::{join_all, BoxFuture};
+use futures::future::BoxFuture;
 use std::time::Instant;
 use serde_json::json;
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
-use std::fs::{OpenOptions, File};
-use std::io::{self, BufRead, Write};
+use std::io::{self};
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
 use tokio::io::AsyncWriteExt;
@@ -228,7 +227,6 @@ impl ComponentsExecutorManager {
             cache.store_current(component.clone(), input.clone()).await;
         }
 
-        // Clone what we need from self early
         let components = self.components.clone();
         let global_cache_config = self.global_cache_config.clone();
 
@@ -237,116 +235,127 @@ impl ComponentsExecutorManager {
 
         let mut final_output = None;
 
-        for component_enum in &sorted_components {
-            let node = component_nodes.get(component_enum)
-                .ok_or_else(|| ComponentError::ComponentNotFound(component_enum.clone()))?;
+        // Group components by their "level" (distance from root)
+        let mut levels: HashMap<usize, Vec<ComponentEnum>> = HashMap::new();
+        let mut component_levels = HashMap::new();
 
-            // Add debug logging using component name
-            if let Some(component) = self.components.get(component_enum) {
-                println!("🔄 Processing component: {:?}", component.name());
-            }
-
-            // Get inputs for this component from its dependencies
-            let component_input = if let Some(deps) = node.dependencies.first() {
-                // Use the first dependency's output as input
-                cache.get(deps).await
-                    .ok_or_else(|| ComponentError::DependencyFailed(deps.clone()))?
-                    .into()  // Convert BaseComponentOutput to BaseComponentInput
+        // Calculate level for each component
+        for component in &sorted_components {
+            let level = if let Some(node) = component_nodes.get(component) {
+                let dep_level = node.dependencies.iter()
+                    .map(|dep| component_levels.get(dep).unwrap_or(&0))
+                    .max()
+                    .unwrap_or(&0);
+                dep_level + 1
             } else {
-                // If no dependencies, use the provided input if available
-                inputs.get(component_enum)
-                    .cloned()
-                    .map(Into::into)  // Convert to BaseComponentInput if available
-                    .unwrap_or_else(|| BaseComponentInput {
-                        data: json!({}),
-                        context: RequestContext {
-                            request_id,
-                            timestamp: Utc::now(),
-                        },
-                    })
+                0
             };
+            component_levels.insert(component.clone(), level);
+            levels.entry(level).or_default().push(component.clone());
+        }
 
-            // Check for specific historical output first
-            if let Some(history_source) = &node.cache_config.current.use_history {
-                if let Some(cache) = self.cache.as_ref() {
-                    if let Some(historical_output) = cache.get_historical(
-                        history_source.request_id,
-                        component_enum
-                    ).await {
-                        println!("🕰️ Using historical output from request {} for {:#?}",
-                            history_source.request_id, component_enum);
-                        final_output = Some(historical_output);
-                        continue;
+        // Process each level in order
+        for level in 0..=*component_levels.values().max().unwrap_or(&0) {
+            if let Some(components_at_level) = levels.get(&level) {
+                println!("🌟 Processing level {}: {:?}", level, components_at_level);
+
+                let mut futures = Vec::new();
+
+                for component_enum in components_at_level {
+                    let node = component_nodes.get(component_enum)
+                        .ok_or_else(|| ComponentError::ComponentNotFound(component_enum.clone()))?;
+
+                    // Check for required historical output first
+                    if let Some(history_source) = &node.cache_config.current.use_history {
+                        if let Some(cache) = self.cache.as_ref() {
+                            match cache.get_historical(
+                                history_source.request_id,
+                                component_enum
+                            ).await {
+                                Some(historical_output) => {
+                                    println!("🕰️ Using historical output from request {} for {:#?}",
+                                        history_source.request_id, component_enum);
+                                    cache.store_current(component_enum.clone(), historical_output.clone()).await;
+                                    continue;
+                                }
+                                None if history_source.strict => {
+                                    return Err(ComponentError::ExecutionError(
+                                        format!("Required historical output not found for component {:?} from request {}",
+                                            component_enum, history_source.request_id)
+                                    ));
+                                }
+                                None => {
+                                    println!("⚠️ Historical output not found for {:#?}, falling back to execution",
+                                        component_enum);
+                                }
+                            }
+                        }
+                    }
+
+                    // Get inputs for this component
+                    let component_input = if let Some(deps) = node.dependencies.first() {
+                        cache.get(deps).await
+                            .ok_or_else(|| ComponentError::DependencyFailed(deps.clone()))?
+                            .into()
+                    } else {
+                        inputs.get(&component_enum)
+                            .cloned()
+                            .map(Into::into)
+                            .unwrap_or_default()
+                    };
+
+                    // Clone what we need for the spawned task
+                    let component_enum = component_enum.clone();
+                    let cache = cache.clone();
+                    let components = components.clone();
+                    let context = RequestContext {
+                        request_id,
+                        timestamp: Utc::now(),
+                    };
+
+                    // Spawn the execution with context
+                    let future = tokio::spawn(async move {
+                        let component = components
+                            .get(&component_enum)
+                            .ok_or_else(|| ComponentError::ComponentNotFound(component_enum.clone()))?;
+
+                        println!("⚙️ Executing component: {:?}", component.name());
+
+                        match component.execute(component_input, cache.clone(), context).await {
+                            Ok(output) => {
+                                println!("✅ Component {:?} completed successfully", component.name());
+                                Ok((component_enum, output))
+                            }
+                            Err(e) => {
+                                println!("❌ Component {:?} failed: {}", component.name(), e);
+                                Err(ComponentError::ExecutionError(e))
+                            }
+                        }
+                    });
+
+                    futures.push(future);
+                }
+
+                // Wait for all components at this level to complete
+                let results = futures::future::join_all(futures).await;
+
+                // Process results and update cache
+                for result in results {
+                    match result {
+                        Ok(Ok((component, output))) => {
+                            // Store in cache immediately
+                            cache.store_current(component.clone(), output.clone()).await;
+                            cache.insert(component.clone(), output.clone()).await;
+                            final_output = Some(output);
+                        }
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => return Err(ComponentError::ExecutionError(format!("Task join error: {}", e))),
                     }
                 }
+
+                // Add a small delay to ensure cache updates are complete
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-
-            // Fall back to normal cache/execution logic
-            let use_cached = node.cache_config.current.use_cached ||
-                global_cache_config.current.use_cached;
-            let should_cache_current = node.cache_config.current.cache_output ||
-                global_cache_config.current.cache_output;
-            let should_store_history = node.cache_config.history.store_output ||
-                global_cache_config.history.store_output;
-
-            if use_cached {
-                if let Some(cached) = cache.get(component_enum).await {
-                    println!("🎯 Using cached output for {:#?}", component_enum);
-                    final_output = Some(cached.clone());
-                    continue;
-                }
-            }
-
-            let component_enum = component_enum.clone();
-            let cache = cache.clone();
-            let components = components.clone();
-            let context = RequestContext {
-                request_id,
-                timestamp: Utc::now(),
-            };
-
-            let execution_result = tokio::spawn(async move {
-                let component = components
-                    .get(&component_enum)
-                    .ok_or_else(|| ComponentError::ComponentNotFound(component_enum.clone()))?;
-
-                println!("⚙️ Executing component: {:?}", component.name());
-
-                match component.execute(component_input, cache.clone(), context.clone()).await {
-                    Ok(output) => {
-                        println!("✅ Component {:?} completed successfully", component.name());
-                        // Always store in history if configured
-                        if should_store_history {
-                            cache.insert(component_enum.clone(), output.clone()).await;
-                        }
-
-                        // Only store successful outputs in current cache if configured
-                        if should_cache_current && matches!(output.state, CompletionState::Success) {
-                            cache.store_current(component_enum.clone(), output.clone()).await;
-                        }
-                        Ok(output)
-                    }
-                    Err(e) => {
-                        println!("❌ Component {:?} failed: {}", component.name(), e);
-                        // Store failure in history
-                        let failure_output = BaseComponentOutput {
-                            state: CompletionState::Failure,
-                            cacheable_data: json!({ "error": e.to_string() }),
-                            context,
-                        };
-
-                        if should_store_history {
-                            cache.insert(component_enum.clone(), failure_output.clone()).await;
-                        }
-
-                        Err(ComponentError::ExecutionError(e))
-                    }
-                }
-            })
-            .await
-            .map_err(|e| ComponentError::ExecutionError(format!("Task join error: {}", e)))??;
-
-            final_output = Some(execution_result);
         }
 
         final_output.ok_or_else(|| ComponentError::ExecutionError("No components executed".to_string()))
@@ -694,13 +703,20 @@ impl Default for BaseComponentInput {
     }
 }
 
-// Add a history source configuration
+// Add a strict mode to history source configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistorySource {
     request_id: Uuid,
-    // Optionally add timestamp bounds
-    // min_timestamp: Option<DateTime<Utc>>,
-    // max_timestamp: Option<DateTime<Utc>>,
+    strict: bool,  // If true, fail if history not found
+}
+
+impl Default for HistorySource {
+    fn default() -> Self {
+        Self {
+            request_id: Uuid::new_v4(),
+            strict: true,  // Default to strict mode
+        }
+    }
 }
 
 fn build_dag_from_json(dag_config: serde_json::Value) -> Result<(
@@ -804,7 +820,10 @@ fn build_dag_from_json(dag_config: serde_json::Value) -> Result<(
                     use_history: c.get("use_history")
                         .and_then(|v| v.as_object())
                         .map(|v| HistorySource {
-                            request_id: Uuid::parse_str(v.get("request_id").and_then(|v| v.as_str()).unwrap()).unwrap(),
+                            request_id: Uuid::parse_str(
+                                v.get("request_id").and_then(|v| v.as_str()).unwrap()
+                            ).unwrap(),
+                            strict: v.get("strict").and_then(|v| v.as_bool()).unwrap_or(true),  // Default to true
                         }),
                 },
                 history: HistoryCacheConfig {
@@ -841,10 +860,11 @@ async fn main() {
             },
             "cache": {
                 "current": {
-                    //"cache_output": true,
-                    //"use_cached": true,
+                    "cache_output": true,
+                    "use_cached": true,
                     "use_history": {
-                        "request_id": specific_request.to_string()
+                        "request_id": specific_request.to_string(),
+                        "strict": true  // Fail if this history isn't found
                     }
                 },
                 "history": {
@@ -915,6 +935,7 @@ async fn main() {
                 use_cached: true,
                 use_history: Some(HistorySource {
                     request_id: specific_request,
+                    strict: true,  // Add strict mode
                 }),
             },
             history: HistoryCacheConfig {
