@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
 use tokio::io::AsyncWriteExt;
 
-// Placeholder Enums and Types
+/// Some fake Components, all have (String) to allow for different instances
+/// This way you can have multiple "Example" components, each with their own configuration
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 enum ComponentEnum {
     Example(String),
@@ -20,6 +21,8 @@ enum ComponentEnum {
     Aggregator(String),
 }
 
+/// Since we want be able to cache input and output, we enforce data is serializable
+/// The request context is used for cache keys
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BaseComponentInput {
     data: serde_json::Value,
@@ -53,9 +56,8 @@ struct CacheConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CurrentCacheConfig {
-    cache_output: bool,      // Whether to cache this component's output
-    use_cached: bool,        // Whether to use cached outputs from dependencies
-    use_history: Option<HistorySource>,  // New field to specify historical output
+    cache_output: bool,
+    use_cached: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,7 @@ struct HistoryCacheConfig {
     store_output: bool,
     storage: HistoryStorage,
     load_from_history: bool,
+    use_history: Option<HistorySource>,
 }
 
 impl Default for HistoryCacheConfig {
@@ -83,6 +86,7 @@ impl Default for HistoryCacheConfig {
             store_output: true,
             storage: HistoryStorage::default(),
             load_from_history: false,
+            use_history: None,
         }
     }
 }
@@ -93,12 +97,12 @@ impl Default for CacheConfig {
             current: CurrentCacheConfig {
                 cache_output: true,
                 use_cached: true,
-                use_history: None,
             },
             history: HistoryCacheConfig {
                 store_output: true,
                 storage: HistoryStorage::default(),
                 load_from_history: false,
+                use_history: None,
             },
         }
     }
@@ -130,7 +134,6 @@ trait AsyncComponent: Send + Sync {
     fn execute(
         &self,
         input: BaseComponentInput,
-        cache: ComponentCache,
         context: RequestContext,
     ) -> BoxFuture<'static, Result<BaseComponentOutput, String>>;
 }
@@ -140,28 +143,36 @@ trait BlockingComponent: Send + Sync {
     fn execute(
         &self,
         input: BaseComponentInput,
-        cache: ComponentCache,
         context: RequestContext,
     ) -> Result<BaseComponentOutput, String>;
 }
 
-// Then define the execution mode enum
+/// We don't want different Components to starve each other by not yielding in async
+/// Async is really for maximizing throughput, not minimizing latency
+/// There's no programatic and perfect way to detect if a Component is not yielding
+/// so we just use this enum to explicitly state the execution mode and ask implementers to do the right thing
 enum ComponentExecutionMode {
+    /// If your component is async (eg. non-blocking IO), use this
     Async(Arc<dyn AsyncComponent>),
+    /// If your component is blocking (eg. CPU intensive tasks), use this
     Blocking(Arc<dyn BlockingComponent>),
 }
 
 impl ComponentExecutionMode {
-    async fn execute(&self, input: BaseComponentInput, cache: ComponentCache, context: RequestContext) -> Result<BaseComponentOutput, String> {
+    async fn execute(
+        &self,
+        input: BaseComponentInput,
+        context: RequestContext,
+    ) -> Result<BaseComponentOutput, String> {
         match self {
             ComponentExecutionMode::Async(component) => {
                 let component = component.clone();
-                component.execute(input, cache, context).await
+                component.execute(input, context).await
             }
             ComponentExecutionMode::Blocking(component) => {
                 let component = component.clone();
                 tokio::task::spawn_blocking(move || {
-                    component.execute(input, cache, context)
+                    component.execute(input, context)
                 })
                 .await
                 .map_err(|e| format!("Task panicked: {}", e))?
@@ -237,7 +248,6 @@ impl ComponentsExecutorManager {
         }
 
         let components = self.components.clone();
-        let global_cache_config = self.global_cache_config.clone();
 
         let sorted_components = self.topologically_sort_components(&component_nodes)
             .map_err(|_| ComponentError::CyclicDependency)?;
@@ -263,7 +273,7 @@ impl ComponentsExecutorManager {
             levels.entry(level).or_default().push(component.clone());
         }
 
-        // Process each level in order
+        // Process each level in order (where we get parallelism)
         for level in 0..=*component_levels.values().max().unwrap_or(&0) {
             if let Some(components_at_level) = levels.get(&level) {
                 println!("🌟 Processing level {}: {:?}", level, components_at_level);
@@ -275,11 +285,11 @@ impl ComponentsExecutorManager {
                         .ok_or_else(|| ComponentError::ComponentNotFound(component_enum.clone()))?;
 
                     // Check history requirements - use node config or fall back to global
-                    let use_history = node.cache_config.current.use_history
+                    let use_history = node.cache_config.history.use_history
                         .as_ref()
                         .or_else(|| {
                             println!("ℹ️ No node-specific history config for {:#?}, using global", component_enum);
-                            self.global_cache_config.current.use_history.as_ref()
+                            self.global_cache_config.history.use_history.as_ref()
                         })
                         .map(|h| h.clone());
 
@@ -337,10 +347,9 @@ impl ComponentsExecutorManager {
 
                         println!("⚙️ Executing component: {:?}", component.name());
 
-                        match component.execute(component_input, cache.clone(), context).await {
+                        match component.execute(component_input, context).await {
                             Ok(output) => {
                                 println!("✅ Component {:?} completed successfully", component.name());
-                                // Store in cache immediately
                                 cache.store_current(component_enum.clone(), output.clone()).await;
                                 cache.store_history(component_enum.clone(), output.clone()).await;
                                 Ok((component_enum, output))
@@ -358,7 +367,6 @@ impl ComponentsExecutorManager {
                 // Wait for all components at this level to complete
                 let results = futures::future::join_all(level_futures).await;
 
-                // Process results and update cache
                 for result in results {
                     match result {
                         Ok(Ok((component, output))) => {
@@ -449,33 +457,23 @@ impl AsyncComponent for ExampleComponent {
     fn execute(
         &self,
         input: BaseComponentInput,
-        cache: ComponentCache,
         context: RequestContext,
     ) -> BoxFuture<'static, Result<BaseComponentOutput, String>> {
         let instance_name = self.instance_name.clone();
 
         Box::pin(async move {
             println!("Processing input data: {:?}", input.data);
-
             let start = Instant::now();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-            let output = BaseComponentOutput {
+            Ok(BaseComponentOutput {
                 state: CompletionState::Success,
                 cacheable_data: json!({
                     "input_data": input.data,
                     "processed_at": input.context.timestamp,
                 }),
                 context,
-            };
-
-            // Use the proper cache methods
-            cache.store_history(
-                ComponentEnum::Example(instance_name),
-                output.clone()
-            ).await;
-
-            Ok(output)
+            })
         })
     }
 }
@@ -503,10 +501,13 @@ impl BlockingComponent for TransformComponent {
         ComponentEnum::Transform(self.instance_name.clone())
     }
 
-    fn execute(&self, _input: BaseComponentInput, _cache: ComponentCache, context: RequestContext) -> Result<BaseComponentOutput, String> {
+    fn execute(
+        &self,
+        input: BaseComponentInput,
+        context: RequestContext,
+    ) -> Result<BaseComponentOutput, String> {
         let start = Instant::now();
 
-        // Use config values
         let mut result = 0u64;
         for i in 0..self.config.iterations {
             result = result.wrapping_add(i % self.config.modulo);
@@ -519,7 +520,7 @@ impl BlockingComponent for TransformComponent {
                 "result": result,
                 "processing_time": start.elapsed().as_millis()
             }),
-            context: context,
+            context,
         })
     }
 }
@@ -537,12 +538,12 @@ impl AsyncComponent for ValidationComponent {
     fn execute(
         &self,
         _input: BaseComponentInput,
-        _cache: ComponentCache,
-        _context: RequestContext,
+        context: RequestContext,
     ) -> BoxFuture<'static, Result<BaseComponentOutput, String>> {
         Box::pin(async move {
             let start = Instant::now();
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            // NOTE: simulate random failure to make sure that we can handle it
             let result = if rand::random::<bool>() {
                 println!("❌ ValidationComponent failed after {:?}", start.elapsed());
                 Err("Validation failed".to_string())
@@ -551,10 +552,7 @@ impl AsyncComponent for ValidationComponent {
                 Ok(BaseComponentOutput {
                     state: CompletionState::Success,
                     cacheable_data: json!({}),
-                    context: RequestContext {
-                        request_id: Uuid::new_v4(),
-                        timestamp: Utc::now(),
-                    },
+                    context,
                 })
             };
             result
@@ -575,26 +573,21 @@ impl AsyncComponent for AggregatorComponent {
     fn execute(
         &self,
         _input: BaseComponentInput,
-        _cache: ComponentCache,
-        _context: RequestContext,
+        context: RequestContext,
     ) -> BoxFuture<'static, Result<BaseComponentOutput, String>> {
         Box::pin(async move {
             let start = Instant::now();
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             println!("⚙️  AggregatorComponent processing took {:?}", start.elapsed());
             Ok(BaseComponentOutput {
                 state: CompletionState::Success,
                 cacheable_data: json!({}),
-                context: RequestContext {
-                    request_id: Uuid::new_v4(),
-                    timestamp: Utc::now(),
-                },
+                context,
             })
         })
     }
 }
 
-// First, define our cache types
 type CurrentCache = Arc<Mutex<HashMap<ComponentEnum, BaseComponentOutput>>>;
 type HistoryKey = (Uuid, ComponentEnum);
 type HistoryCache = Arc<Mutex<BTreeMap<HistoryKey, BaseComponentOutput>>>;
@@ -690,7 +683,6 @@ impl ComponentCache {
         None
     }
 
-    // Also update history loading to be async
     async fn load_history_from_file(&self) -> io::Result<()> {
         if let HistoryStorage::File(path) = &self.storage_config {
             let contents = tokio::fs::read_to_string(path).await?;
@@ -753,7 +745,7 @@ impl Default for HistorySource {
     fn default() -> Self {
         Self {
             request_id: Uuid::new_v4(),
-            strict: true,  // Default to strict mode
+            strict: true,  // Default to strict mode (fail if history not found)
         }
     }
 }
@@ -765,7 +757,7 @@ fn build_dag_from_json(dag_config: serde_json::Value) -> Result<(
     // Define the factory function type
     type ComponentFactory = Box<dyn Fn(String) -> ComponentExecutionMode>;
 
-    // Remove mut since we're not modifying the HashMap
+    // where you register your Components to JSON config names
     let component_factory = HashMap::from([
         (
             "example",
@@ -800,25 +792,21 @@ fn build_dag_from_json(dag_config: serde_json::Value) -> Result<(
     let mut components = HashMap::new();
     let mut nodes = HashMap::new();
 
-    // Parse the DAG configuration
     let dag = dag_config.as_object().ok_or("Invalid DAG configuration")?;
 
     for (node_name, node_config) in dag {
         let node_obj = node_config.as_object().ok_or("Invalid node configuration")?;
 
-        // Get component type
         let component_type = node_obj["type"]
             .as_str()
             .ok_or("Component type not specified")?;
 
-        // Create component with instance name
         let component = if let Some(factory_fn) = component_factory.get(component_type) {
             factory_fn(node_name.clone())
         } else {
             return Err(format!("Unknown component type: {}", component_type));
         };
 
-        // Map string to ComponentEnum with instance name
         let component_enum = match component_type {
             "example" => ComponentEnum::Example(node_name.clone()),
             "transform" => ComponentEnum::Transform(node_name.clone()),
@@ -827,14 +815,12 @@ fn build_dag_from_json(dag_config: serde_json::Value) -> Result<(
             _ => return Err(format!("Unknown component type: {}", component_type)),
         };
 
-        // Get dependencies - now using node_name for lookup
         let dependencies = node_obj["dependencies"]
             .as_array()
             .unwrap_or(&Vec::new())
             .iter()
             .map(|dep| {
                 let dep_name = dep.as_str().ok_or_else(|| format!("Invalid dependency name"))?;
-                // Find the matching component type from the already processed nodes
                 dag.get(dep_name)
                     .and_then(|n| n.get("type"))
                     .and_then(|t| t.as_str())
@@ -844,40 +830,66 @@ fn build_dag_from_json(dag_config: serde_json::Value) -> Result<(
                         "transform" => ComponentEnum::Transform(dep_name.to_string()),
                         "validation" => ComponentEnum::Validation(dep_name.to_string()),
                         "aggregator" => ComponentEnum::Aggregator(dep_name.to_string()),
-                        _ => panic!("Invalid component type"), // Should never happen as we validated earlier
+                        _ => panic!("Invalid component type"),
                     })
             })
             .collect::<Result<Vec<ComponentEnum>, String>>()?;
 
-        // Parse cache config
         let cache_config = node_obj.get("cache")
             .and_then(|c| c.as_object())
-            .map(|c| CacheConfig {
-                current: CurrentCacheConfig {
-                    cache_output: c.get("cache_output").and_then(|v| v.as_bool()).unwrap_or(true),
-                    use_cached: c.get("use_cached").and_then(|v| v.as_bool()).unwrap_or(true),
-                    use_history: c.get("use_history")
-                        .and_then(|v| v.as_object())
-                        .map(|v| HistorySource {
-                            request_id: Uuid::parse_str(
-                                v.get("request_id").and_then(|v| v.as_str()).unwrap()
-                            ).unwrap(),
-                            strict: v.get("strict").and_then(|v| v.as_bool()).unwrap_or(true),  // Default to true
-                        }),
-                },
-                history: HistoryCacheConfig {
-                    store_output: c.get("store_output").and_then(|v| v.as_bool()).unwrap_or(true),
-                    storage: HistoryStorage::File(PathBuf::from("/tmp/dag_history.jsonl")),
-                    load_from_history: c.get("load_from_history").and_then(|v| v.as_bool()).unwrap_or(false),
-                },
+            .map(|c| {
+                let empty_map = serde_json::Map::new();
+
+                let current = c.get("current")
+                    .and_then(|v| v.as_object())
+                    .unwrap_or(&empty_map);
+
+                let history = c.get("history")
+                    .and_then(|v| v.as_object())
+                    .unwrap_or(&empty_map);
+
+                CacheConfig {
+                    current: CurrentCacheConfig {
+                        cache_output: current.get("cache_output")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
+                        use_cached: current.get("use_cached")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
+                    },
+                    history: HistoryCacheConfig {
+                        store_output: history.get("store_output")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
+                        storage: HistoryStorage::File(PathBuf::from("/tmp/dag_history.jsonl")),
+                        load_from_history: history.get("load_from_history")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        use_history: history.get("use_history")
+                            .and_then(|v| v.as_object())
+                            .map(|v| HistorySource {
+                                request_id: Uuid::parse_str(
+                                    v.get("request_id")
+                                        .and_then(|v| v.as_str())
+                                        .ok_or("Missing request_id in use_history")
+                                        .unwrap()
+                                ).unwrap(),
+                                strict: v.get("strict")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(true),
+                            }),
+                    },
+                }
             })
             .unwrap_or_default();
 
         components.insert(component_enum.clone(), component);
-        nodes.insert(component_enum, ComponentNode {
+        let component_node = ComponentNode {
             dependencies,
             cache_config,
-        });
+        };
+        println!("Component Node: {:?}", component_node);
+        nodes.insert(component_enum, component_node);
     }
 
     Ok((components, nodes))
@@ -886,7 +898,7 @@ fn build_dag_from_json(dag_config: serde_json::Value) -> Result<(
 // Updated main function
 #[tokio::main]
 async fn main() {
-    // Define DAG using JSON
+    // Define DAG using JSON (I had this request in my local file, you need to change it)
     let specific_request = Uuid::parse_str("3cd1e52b-d05c-47c8-9af0-c950256bf52c").unwrap();
 
     let dag_config = json!({
@@ -902,12 +914,12 @@ async fn main() {
                     //"cache_output": true,
                     // when using history, we don't want to use the cache
                     //"use_cached": true,
+                },
+                "history": {
                     "use_history": {
                         "request_id": specific_request.to_string(),
                         "strict": true  // Fail if this history isn't found
-                    }
-                },
-                "history": {
+                    },
                     "store_output": true
                 }
             },
@@ -973,12 +985,12 @@ async fn main() {
             current: CurrentCacheConfig {
                 cache_output: true,
                 use_cached: true,
-                use_history: None,
             },
             history: HistoryCacheConfig {
                 store_output: true,
                 storage: HistoryStorage::File(PathBuf::from("/tmp/dag_history.jsonl")),
                 load_from_history: true,
+                use_history: None,
             },
         }),
         None,
