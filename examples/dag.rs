@@ -116,16 +116,15 @@ struct ComponentExecutionState {
     state: CompletionState,
 }
 
-// First, let's create a more specific error type
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 enum ComponentError {
-    ExecutionError(String),
-    DependencyFailed(ComponentEnum),
     ComponentNotFound(ComponentEnum),
+    DependencyFailed(ComponentEnum),
     CyclicDependency,
+    ExecutionError(String),
+    HistoryNotFound(ComponentEnum, Uuid),
 }
 
-// First, define the component traits
 trait AsyncComponent: Send + Sync {
     fn name(&self) -> ComponentEnum;
     fn execute(
@@ -182,7 +181,7 @@ impl ComponentExecutionMode {
 struct ComponentsExecutorManager {
     components: Arc<HashMap<ComponentEnum, ComponentExecutionMode>>,
     global_cache_config: CacheConfig,  // Global settings that can be overridden per node
-    cache: Option<ComponentCache>,  // Add this field
+    cache: Option<ComponentCache>,
 }
 
 impl ComponentsExecutorManager {
@@ -212,6 +211,16 @@ impl ComponentsExecutorManager {
         }
     }
 
+    /// Executes the DAG by processing components in topologically sorted order
+    /// Components at the same level (no dependencies between them) are executed in parallel
+    ///
+    /// # Arguments
+    /// * `component_nodes` - Map of components and their dependency configuration
+    /// * `inputs` - Initial inputs for source nodes (nodes with no dependencies)
+    /// * `request_id` - Unique identifier for this DAG execution
+    ///
+    /// # Returns
+    /// The output of the final component in the DAG, or an error if execution fails
     async fn execute(
         &self,
         component_nodes: HashMap<ComponentEnum, ComponentNode>,
@@ -259,42 +268,45 @@ impl ComponentsExecutorManager {
             if let Some(components_at_level) = levels.get(&level) {
                 println!("🌟 Processing level {}: {:?}", level, components_at_level);
 
-                let mut futures = Vec::new();
+                let mut level_futures = Vec::new();
 
                 for component_enum in components_at_level {
                     let node = component_nodes.get(component_enum)
                         .ok_or_else(|| ComponentError::ComponentNotFound(component_enum.clone()))?;
 
-                    // Check for required historical output first
-                    if let Some(history_source) = &node.cache_config.current.use_history {
-                        if let Some(cache) = self.cache.as_ref() {
-                            match cache.get_historical(
-                                history_source.request_id,
-                                component_enum
-                            ).await {
-                                Some(historical_output) => {
-                                    println!("🕰️ Using historical output from request {} for {:#?}",
-                                        history_source.request_id, component_enum);
-                                    cache.store_current(component_enum.clone(), historical_output.clone()).await;
-                                    continue;
-                                }
-                                None if history_source.strict => {
-                                    return Err(ComponentError::ExecutionError(
-                                        format!("Required historical output not found for component {:?} from request {}",
-                                            component_enum, history_source.request_id)
-                                    ));
-                                }
-                                None => {
-                                    println!("⚠️ Historical output not found for {:#?}, falling back to execution",
-                                        component_enum);
-                                }
-                            }
+                    // Check history requirements - only use if specifically configured for this node
+                    let use_history = node.cache_config.current.use_history
+                        .as_ref()  // Only use node config, don't fall back to global
+                        .map(|h| h.clone());
+
+                    if let Some(history_source) = use_history {
+                        if let Some(historical_output) = cache.get_historical(
+                            history_source.request_id,
+                            component_enum
+                        ).await {
+                            println!("🕰️ Using historical output for {:#?}", component_enum);
+                            cache.store_current(component_enum.clone(), historical_output.clone()).await;
+                            continue;
+                        } else if history_source.strict {
+                            return Err(ComponentError::HistoryNotFound(
+                                component_enum.clone(),
+                                history_source.request_id
+                            ));
+                        }
+                    }
+
+                    // Use current cache if enabled
+                    if node.cache_config.current.use_cached {
+                        if let Some(cached) = cache.get_current(component_enum).await {
+                            println!("🎯 Using cached output for {:#?}", component_enum);
+                            final_output = Some(cached.clone());
+                            continue;
                         }
                     }
 
                     // Get inputs for this component
                     let component_input = if let Some(deps) = node.dependencies.first() {
-                        cache.get(deps).await
+                        cache.get_current(deps).await
                             .ok_or_else(|| ComponentError::DependencyFailed(deps.clone()))?
                             .into()
                     } else {
@@ -324,6 +336,9 @@ impl ComponentsExecutorManager {
                         match component.execute(component_input, cache.clone(), context).await {
                             Ok(output) => {
                                 println!("✅ Component {:?} completed successfully", component.name());
+                                // Store in cache immediately
+                                cache.store_current(component_enum.clone(), output.clone()).await;
+                                cache.store_history(component_enum.clone(), output.clone()).await;
                                 Ok((component_enum, output))
                             }
                             Err(e) => {
@@ -333,28 +348,22 @@ impl ComponentsExecutorManager {
                         }
                     });
 
-                    futures.push(future);
+                    level_futures.push(future);
                 }
 
                 // Wait for all components at this level to complete
-                let results = futures::future::join_all(futures).await;
+                let results = futures::future::join_all(level_futures).await;
 
                 // Process results and update cache
                 for result in results {
                     match result {
                         Ok(Ok((component, output))) => {
-                            // Store in cache immediately
-                            cache.store_current(component.clone(), output.clone()).await;
-                            cache.insert(component.clone(), output.clone()).await;
                             final_output = Some(output);
                         }
                         Ok(Err(e)) => return Err(e),
                         Err(e) => return Err(ComponentError::ExecutionError(format!("Task join error: {}", e))),
                     }
                 }
-
-                // Add a small delay to ensure cache updates are complete
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
 
@@ -402,7 +411,7 @@ impl ComponentsExecutorManager {
         Ok(())
     }
 
-    // Add this new method
+    // Retrieves the entire cache history
     async fn get_cache_history(&self) -> Vec<(HistoryKey, BaseComponentOutput)> {
         if let Some(cache) = self.cache.as_ref() {
             let history = cache.history.lock().await;
@@ -414,17 +423,12 @@ impl ComponentsExecutorManager {
         }
     }
 
+    // Retrieves history for a specific request by filtering the entire cache history
     async fn get_request_history(&self, request_id: Uuid) -> Vec<(ComponentEnum, BaseComponentOutput)> {
-        if let Some(cache) = self.cache.as_ref() {
-            // Use get_historical for specific lookups
-            let history = cache.history.lock().await;
-            history.iter()
-                .filter(|((req_id, _), _)| *req_id == request_id)
-                .map(|((_, component), output)| (component.clone(), output.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        }
+        self.get_cache_history().await.into_iter()
+            .filter(|((req_id, _), _)| *req_id == request_id)
+            .map(|((_, component), output)| (component, output))
+            .collect()
     }
 }
 
@@ -462,7 +466,7 @@ impl AsyncComponent for ExampleComponent {
             };
 
             // Use the proper cache methods
-            cache.insert(
+            cache.store_history(
                 ComponentEnum::Example(instance_name),
                 output.clone()
             ).await;
@@ -472,7 +476,6 @@ impl AsyncComponent for ExampleComponent {
     }
 }
 
-// Add configuration struct
 #[derive(Clone, Serialize, Deserialize)]
 struct TransformConfig {
     iterations: u64,
@@ -592,17 +595,19 @@ type CurrentCache = Arc<Mutex<HashMap<ComponentEnum, BaseComponentOutput>>>;
 type HistoryKey = (Uuid, ComponentEnum);
 type HistoryCache = Arc<Mutex<BTreeMap<HistoryKey, BaseComponentOutput>>>;
 
-// Then define our ComponentCache struct
-#[derive(Clone)]  // No Serialize/Deserialize here!
+#[derive(Clone)]
 struct ComponentCache {
+    /// Cache for current DAG execution (in memory)
     current: CurrentCache,
+    /// Historical cache from previous DAG executions (in memory and file)
     history: HistoryCache,
+    /// Configuration for persistent storage
     storage_config: HistoryStorage,
 }
 
 // Implement methods for ComponentCache
 impl ComponentCache {
-    fn new(storage_config: HistoryStorage) -> Self {  // This is the key fix - no arguments needed
+    fn new(storage_config: HistoryStorage) -> Self {
         Self {
             current: Arc::new(Mutex::new(HashMap::new())),
             history: Arc::new(Mutex::new(BTreeMap::new())),
@@ -614,7 +619,9 @@ impl ComponentCache {
         self.current.lock().await.insert(component, output);
     }
 
-    async fn insert(&self, component: ComponentEnum, output: BaseComponentOutput) {
+    /// Stores component output in both current and historical caches
+    /// Also writes to persistent storage if configured
+    async fn store_history(&self, component: ComponentEnum, output: BaseComponentOutput) {
         // Store in memory caches
         let history_key = (output.context.request_id, component.clone());
         self.history.lock().await.insert(history_key, output.clone());
@@ -629,14 +636,12 @@ impl ComponentCache {
             };
 
             if let Ok(json) = serde_json::to_string(&entry) {
-                // Use tokio's async file operations
                 if let Ok(mut file) = tokio::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(path)
                     .await
                 {
-                    // Write line and flush asynchronously
                     let _ = file.write_all(json.as_bytes()).await;
                     let _ = file.write_all(b"\n").await;
                     let _ = file.flush().await;
@@ -645,13 +650,40 @@ impl ComponentCache {
         }
     }
 
-    async fn get(&self, component: &ComponentEnum) -> Option<BaseComponentOutput> {
+    async fn get_current(&self, component: &ComponentEnum) -> Option<BaseComponentOutput> {
         self.current.lock().await.get(component).cloned()
     }
 
+    /// Retrieves historical output for a specific component from a previous DAG execution
     async fn get_historical(&self, request_id: Uuid, component: &ComponentEnum) -> Option<BaseComponentOutput> {
+        // First, try to get the historical output from the in-memory cache
         let history = self.history.lock().await;
-        history.get(&(request_id, component.clone())).cloned()
+        if let Some(output) = history.get(&(request_id, component.clone())) {
+            return Some(output.clone());
+        }
+        drop(history); // Release the lock before loading from file
+
+        // If not found in memory, attempt to load from the file
+        if let HistoryStorage::File(path) = &self.storage_config {
+            if let Ok(contents) = tokio::fs::read_to_string(path).await {
+                let mut history = self.history.lock().await;
+                for line in contents.lines() {
+                    if let Ok(entry) = serde_json::from_str::<HistoryEntry>(line) {
+                        history.insert(
+                            (entry.request_id, entry.component.clone()),
+                            entry.output.clone(),
+                        );
+                        // Check if this is the entry we're looking for
+                        if entry.request_id == request_id && entry.component == *component {
+                            return Some(entry.output);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Return None if not found in memory or file
+        None
     }
 
     // Also update history loading to be async
@@ -673,7 +705,6 @@ impl ComponentCache {
     }
 }
 
-// Add serializable history entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistoryEntry {
     request_id: Uuid,
@@ -703,11 +734,15 @@ impl Default for BaseComponentInput {
     }
 }
 
-// Add a strict mode to history source configuration
+/// Configuration for historical data source
+/// Used when a component should use output from a previous DAG execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HistorySource {
+    /// UUID of the previous DAG execution to pull from
     request_id: Uuid,
-    strict: bool,  // If true, fail if history not found
+    /// If true, DAG execution will fail when historical data isn't found
+    /// If false, component will execute normally when history isn't found
+    strict: bool,
 }
 
 impl Default for HistorySource {
@@ -834,7 +869,6 @@ fn build_dag_from_json(dag_config: serde_json::Value) -> Result<(
             })
             .unwrap_or_default();
 
-        // Add component and node
         components.insert(component_enum.clone(), component);
         nodes.insert(component_enum, ComponentNode {
             dependencies,
@@ -935,7 +969,7 @@ async fn main() {
                 use_cached: true,
                 use_history: Some(HistorySource {
                     request_id: specific_request,
-                    strict: true,  // Add strict mode
+                    strict: true,
                 }),
             },
             history: HistoryCacheConfig {
@@ -955,17 +989,14 @@ async fn main() {
 
             // Peek at just this request's history
             println!("\n📜 History for Request {}:", request_id);
-            let history = executor.get_cache_history().await;
-            for ((req_id, component), output) in history {
-                // Only show entries from this request
-                if req_id == request_id {
-                    println!(
-                        "Component: {:?}\n  -> State: {:?}\n  -> Data: {}\n",
-                        component,
-                        output.state,
-                        output.cacheable_data
-                    );
-                }
+            let request_history = executor.get_request_history(request_id).await;
+            for (component, output) in request_history {
+                println!(
+                    "Component: {:?}\n  -> State: {:?}\n  -> Data: {}\n",
+                    component,
+                    output.state,
+                    output.cacheable_data
+                );
             }
         }
         Err(e) => println!("❌ Execution failed: {:?}", e),
