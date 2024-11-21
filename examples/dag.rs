@@ -25,8 +25,9 @@ enum ComponentEnum {
 /// The request context is used for cache keys
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BaseComponentInput {
-    data: serde_json::Value,
+    cacheable_data: serde_json::Value,
     context: RequestContext,
+    consumed_keys: Vec<String>,  // Keys this component expects in cacheable_data
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +41,7 @@ struct BaseComponentOutput {
     state: CompletionState,
     cacheable_data: serde_json::Value,
     context: RequestContext,
+    produced_keys: Vec<String>,  // Keys this component promises to produce in cacheable_data
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +133,8 @@ enum ComponentError {
 
 trait AsyncComponent: Send + Sync {
     fn name(&self) -> ComponentEnum;
+    fn get_consumed_keys(&self) -> Vec<String>;
+    fn get_produced_keys(&self) -> Vec<String>;
     fn execute(
         &self,
         input: BaseComponentInput,
@@ -454,26 +458,52 @@ impl AsyncComponent for ExampleComponent {
         ComponentEnum::Example(self.instance_name.clone())
     }
 
+    fn get_consumed_keys(&self) -> Vec<String> {
+        vec!["input_data".to_string()]
+    }
+
+    fn get_produced_keys(&self) -> Vec<String> {
+        vec!["processed_data".to_string(), "processing_time".to_string()]
+    }
+
     fn execute(
         &self,
         input: BaseComponentInput,
         context: RequestContext,
     ) -> BoxFuture<'static, Result<BaseComponentOutput, String>> {
         let instance_name = self.instance_name.clone();
+        let produced_keys = self.get_produced_keys();
 
         Box::pin(async move {
-            println!("Processing input data: {:?}", input.data);
+            // Validate input
+            input.validate()?;
+
             let start = Instant::now();
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-            Ok(BaseComponentOutput {
+            let output = BaseComponentOutput {
                 state: CompletionState::Success,
                 cacheable_data: json!({
-                    "input_data": input.data,
-                    "processed_at": input.context.timestamp,
+                    "processed_data": input.cacheable_data["input_data"],
+                    "processing_time": start.elapsed().as_millis()
                 }),
-                context,
-            })
+                context: context.clone(),
+                produced_keys: produced_keys.clone(),
+            };
+
+            // Validate output
+            if let Err(e) = output.validate() {
+                return Ok(BaseComponentOutput {
+                    state: CompletionState::Failure,
+                    cacheable_data: json!({
+                        "error": e.to_string()
+                    }),
+                    context,
+                    produced_keys: vec![],  // Failed to produce any keys
+                });
+            }
+
+            Ok(output)
         })
     }
 }
@@ -521,6 +551,7 @@ impl BlockingComponent for TransformComponent {
                 "processing_time": start.elapsed().as_millis()
             }),
             context,
+            produced_keys: vec!["result".to_string(), "processing_time".to_string()],
         })
     }
 }
@@ -533,6 +564,14 @@ struct ValidationComponent {
 impl AsyncComponent for ValidationComponent {
     fn name(&self) -> ComponentEnum {
         ComponentEnum::Validation(self.instance_name.clone())
+    }
+
+    fn get_consumed_keys(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn get_produced_keys(&self) -> Vec<String> {
+        vec!["validation_result".to_string()]
     }
 
     fn execute(
@@ -553,6 +592,7 @@ impl AsyncComponent for ValidationComponent {
                     state: CompletionState::Success,
                     cacheable_data: json!({}),
                     context,
+                    produced_keys: vec!["validation_result".to_string()],
                 })
             };
             result
@@ -570,6 +610,14 @@ impl AsyncComponent for AggregatorComponent {
         ComponentEnum::Aggregator(self.instance_name.clone())
     }
 
+    fn get_consumed_keys(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn get_produced_keys(&self) -> Vec<String> {
+        vec![]
+    }
+
     fn execute(
         &self,
         _input: BaseComponentInput,
@@ -583,6 +631,7 @@ impl AsyncComponent for AggregatorComponent {
                 state: CompletionState::Success,
                 cacheable_data: json!({}),
                 context,
+                produced_keys: vec![],
             })
         })
     }
@@ -653,9 +702,13 @@ impl ComponentCache {
 
     /// Retrieves historical output for a specific component from a previous DAG execution
     async fn get_historical(&self, request_id: Uuid, component: &ComponentEnum) -> Option<BaseComponentOutput> {
+        println!("🔍 Looking for historical output for request {} component {:?}",  // Add this
+            request_id, component);
+
         // First, try to get the historical output from the in-memory cache
         let history = self.history.lock().await;
         if let Some(output) = history.get(&(request_id, component.clone())) {
+            println!("✅ Found in memory cache");  // Add this
             return Some(output.clone());
         }
         drop(history); // Release the lock before loading from file
@@ -666,6 +719,8 @@ impl ComponentCache {
                 let mut history = self.history.lock().await;
                 for line in contents.lines() {
                     if let Ok(entry) = serde_json::from_str::<HistoryEntry>(line) {
+                        println!("✅ Loaded history entry for request {} component {:?}",  // Add this
+                            entry.request_id, entry.component);
                         history.insert(
                             (entry.request_id, entry.component.clone()),
                             entry.output.clone(),
@@ -679,23 +734,32 @@ impl ComponentCache {
             }
         }
 
-        // Return None if not found in memory or file
+        println!("❌ Not found anywhere");  // Add this
         None
     }
 
     async fn load_history_from_file(&self) -> io::Result<()> {
         if let HistoryStorage::File(path) = &self.storage_config {
+            println!("📖 Loading history from {}", path.display());
             let contents = tokio::fs::read_to_string(path).await?;
+            println!("📖 Read {} bytes from file", contents.len());
             let mut history = self.history.lock().await;
 
             for line in contents.lines() {
-                if let Ok(entry) = serde_json::from_str::<HistoryEntry>(line) {
-                    history.insert(
-                        (entry.request_id, entry.component),
-                        entry.output
-                    );
+                println!("📝 Processing line: {}", line);
+                match serde_json::from_str::<HistoryEntry>(line) {
+                    Ok(entry) => {
+                        println!("✅ Successfully parsed entry for request {} component {:?}",
+                            entry.request_id, entry.component);
+                        history.insert(
+                            (entry.request_id, entry.component),
+                            entry.output
+                        );
+                    }
+                    Err(e) => println!("❌ Failed to parse line: {}", e),
                 }
             }
+            println!("📖 Loaded {} entries into memory", history.len());
         }
         Ok(())
     }
@@ -712,8 +776,9 @@ struct HistoryEntry {
 impl From<BaseComponentOutput> for BaseComponentInput {
     fn from(output: BaseComponentOutput) -> Self {
         BaseComponentInput {
-            data: output.cacheable_data,
+            cacheable_data: output.cacheable_data,
             context: output.context,
+            consumed_keys: output.produced_keys,
         }
     }
 }
@@ -721,11 +786,12 @@ impl From<BaseComponentOutput> for BaseComponentInput {
 impl Default for BaseComponentInput {
     fn default() -> Self {
         Self {
-            data: json!({}),
+            cacheable_data: json!({}),
             context: RequestContext {
                 request_id: Uuid::new_v4(),
                 timestamp: Utc::now(),
             },
+            consumed_keys: vec![],
         }
     }
 }
@@ -747,6 +813,35 @@ impl Default for HistorySource {
             request_id: Uuid::new_v4(),
             strict: true,  // Default to strict mode (fail if history not found)
         }
+    }
+}
+
+// Make validation methods take owned values
+impl BaseComponentInput {
+    fn validate(&self) -> Result<(), String> {
+        let data = self.cacheable_data.as_object()
+            .ok_or_else(|| "cacheable_data must be an object".to_string())?;
+
+        for key in &self.consumed_keys {
+            if !data.contains_key(key) {
+                return Err(format!("Missing required key: {}", key));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BaseComponentOutput {
+    fn validate(&self) -> Result<(), String> {
+        let data = self.cacheable_data.as_object()
+            .ok_or_else(|| "cacheable_data must be an object".to_string())?;
+
+        for key in &self.produced_keys {
+            if !data.contains_key(key) {
+                return Err(format!("Component failed to produce promised key: {}", key));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -899,7 +994,7 @@ fn build_dag_from_json(dag_config: serde_json::Value) -> Result<(
 #[tokio::main]
 async fn main() {
     // Define DAG using JSON (I had this request in my local file, you need to change it)
-    let specific_request = Uuid::parse_str("3cd1e52b-d05c-47c8-9af0-c950256bf52c").unwrap();
+    let specific_request = Uuid::parse_str("1c8f864b-2431-4813-ae57-e059fd2feed9").unwrap();
 
     let dag_config = json!({
         "transform_a": {
