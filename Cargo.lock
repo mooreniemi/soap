@@ -1714,6 +1714,7 @@ dependencies = [
  "futures",
  "futures-util",
  "governor",
+ "indexmap",
  "nonzero_ext",
  "notify",
  "pyo3",
