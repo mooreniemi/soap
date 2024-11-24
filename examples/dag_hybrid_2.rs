@@ -10,6 +10,8 @@ use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+const PER_NODE_TIMEOUT_MS: u64 = 100;
+
 /// Runtime values that flow through the DAG
 #[derive(Debug, Clone)]
 pub enum Data {
@@ -155,12 +157,14 @@ impl Data {
     }
 }
 
+pub type ComponentResult = Result<Data, DAGError>;
+
 trait Component: Send + Sync + 'static {
     fn configure(config: Value) -> Self
     where
         Self: Sized;
 
-    fn execute(&self, input: Data) -> Data;
+    fn execute(&self, input: Data) -> ComponentResult;
 
     fn input_type(&self) -> DataType;
 
@@ -278,6 +282,76 @@ impl DAGIR {
     }
 }
 
+#[derive(Debug)]
+pub enum DAGError {
+    /// Represents a type mismatch error.
+    TypeMismatch {
+        node_id: String,
+        expected: DataType,
+        actual: DataType,
+    },
+    /// Represents a missing dependency output.
+    MissingDependency {
+        node_id: String,
+        dependency_id: String,
+    },
+    /// Represents a runtime error during component execution.
+    ExecutionError { node_id: String, reason: String },
+    /// Represents a node not found in the DAG.
+    NodeNotFound { node: String },
+    /// Represents invalid configuration or setup.
+    InvalidConfiguration(String),
+    /// Represents a cycle detected in the DAG.
+    CycleDetected,
+    /// Represents no valid inputs for a node.
+    NoValidInputs { node_id: String, expected: DataType },
+}
+
+impl std::fmt::Display for DAGError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DAGError::TypeMismatch {
+                node_id,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Node {}: Type mismatch. Expected {:?}, got {:?}",
+                    node_id, expected, actual
+                )
+            }
+            DAGError::MissingDependency {
+                node_id,
+                dependency_id,
+            } => {
+                write!(
+                    f,
+                    "Node {}: Missing output from dependency {}",
+                    node_id, dependency_id
+                )
+            }
+            DAGError::ExecutionError { node_id, reason } => {
+                write!(f, "Node {}: Execution failed. Reason: {}", node_id, reason)
+            }
+            DAGError::InvalidConfiguration(reason) => {
+                write!(f, "Invalid configuration: {}", reason)
+            }
+            DAGError::CycleDetected => write!(f, "Cycle detected in the DAG"),
+            DAGError::NodeNotFound { node } => write!(f, "Node {} not found", node),
+            DAGError::NoValidInputs { node_id, expected } => {
+                write!(
+                    f,
+                    "Node {}: No valid inputs. Expected {:?}",
+                    node_id, expected
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DAGError {}
+
 struct DAG {
     nodes: Arc<HashMap<String, Box<dyn Component>>>,
     edges: Arc<HashMap<String, Vec<Edge>>>,
@@ -348,7 +422,7 @@ impl DAG {
         }
     }
 
-    async fn execute(&self) -> Result<(), String> {
+    async fn execute(&self) -> Result<(), DAGError> {
         let mut results: IndexMap<String, Data> = IndexMap::new();
         results.extend((*self.initial_inputs).clone());
 
@@ -358,10 +432,10 @@ impl DAG {
         self.execute_levels(levels, results).await
     }
 
-    fn group_into_levels(&self, sorted_nodes: Vec<String>) -> Result<Vec<Vec<String>>, String> {
+    fn group_into_levels(&self, sorted_nodes: Vec<String>) -> Result<Vec<Vec<String>>, DAGError> {
         let mut levels: Vec<Vec<String>> = Vec::new();
         let mut remaining_nodes: HashSet<String> = sorted_nodes.into_iter().collect();
-        let mut deferred_nodes: Vec<String> = Vec::new();
+        let mut deferred_nodes: HashSet<String> = HashSet::new();
 
         while !remaining_nodes.is_empty() {
             let mut current_level = Vec::new();
@@ -381,17 +455,24 @@ impl DAG {
                 .collect();
 
             if ready_nodes.is_empty() && !remaining_nodes.is_empty() {
-                return Err("Cycle detected in DAG".to_string());
+                return Err(DAGError::CycleDetected);
             }
 
             for node in ready_nodes {
                 let component = self
                     .nodes
                     .get(&node)
-                    .ok_or_else(|| format!("Node {} not found", node))?;
+                    .ok_or_else(|| DAGError::NodeNotFound { node: node.clone() })?;
 
                 if component.is_deferrable() {
-                    deferred_nodes.push(node.clone());
+                    deferred_nodes.insert(node.clone());
+                } else if self
+                    .edges
+                    .get(&node)
+                    .map(|deps| deps.iter().any(|dep| deferred_nodes.contains(&dep.source)))
+                    .unwrap_or(false)
+                {
+                    deferred_nodes.insert(node.clone());
                 } else {
                     current_level.push(node.clone());
                 }
@@ -405,9 +486,25 @@ impl DAG {
 
         if !deferred_nodes.is_empty() {
             if levels.is_empty() {
-                levels.push(deferred_nodes);
-            } else {
-                levels.last_mut().unwrap().extend(deferred_nodes);
+                levels.push(Vec::new());
+            }
+            let last_level = levels.last_mut().unwrap();
+            let mut to_keep_as_deferred = Vec::new();
+
+            for node in deferred_nodes {
+                let deps = self.edges.get(&node).map(|d| d.as_slice()).unwrap_or(&[]);
+                if deps
+                    .iter()
+                    .all(|dep| !remaining_nodes.contains(&dep.source))
+                {
+                    last_level.push(node);
+                } else {
+                    to_keep_as_deferred.push(node);
+                }
+            }
+
+            if !to_keep_as_deferred.is_empty() {
+                levels.push(to_keep_as_deferred);
             }
         }
 
@@ -418,7 +515,7 @@ impl DAG {
         &self,
         levels: Vec<Vec<String>>,
         mut results: IndexMap<String, Data>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DAGError> {
         for (level_idx, level) in levels.iter().enumerate() {
             println!("Executing level {}: {:?}", level_idx, level);
 
@@ -434,7 +531,7 @@ impl DAG {
         &self,
         level: &[String],
         results: &IndexMap<String, Data>,
-    ) -> Result<Vec<(String, Data)>, String> {
+    ) -> Result<Vec<(String, Data)>, DAGError> {
         let nodes = Arc::clone(&self.nodes);
         let edges = Arc::clone(&self.edges);
         let initial_inputs = Arc::clone(&self.initial_inputs);
@@ -446,19 +543,32 @@ impl DAG {
             let edges = Arc::clone(&edges);
             let initial_inputs = Arc::clone(&initial_inputs);
 
-            tokio::spawn(async move {
-                Self::execute_node(&node_id, &results, &nodes, &edges, &initial_inputs)
-            })
+            async move {
+                let node_id_for_error = node_id.clone();
+
+                let handle = tokio::task::spawn_blocking(move || {
+                    Self::execute_node(&node_id, &results, &nodes, &edges, &initial_inputs)
+                });
+
+                match timeout(Duration::from_millis(PER_NODE_TIMEOUT_MS), handle).await {
+                    Ok(Ok(Ok(result))) => Ok(result),
+                    Ok(Ok(Err(e))) => Err(e),
+                    Ok(Err(join_error)) => Err(DAGError::ExecutionError {
+                        node_id: node_id_for_error,
+                        reason: format!("Task join error: {:?}", join_error),
+                    }),
+                    Err(_) => Err(DAGError::ExecutionError {
+                        node_id: node_id_for_error,
+                        reason: format!("Execution timed out after {}ms", PER_NODE_TIMEOUT_MS),
+                    }),
+                }
+            }
         }))
         .await;
 
         level_results
             .into_iter()
-            .map(|res| match res {
-                Ok(Ok(result)) => Ok(result),
-                Ok(Err(e)) => Err(e),
-                Err(e) => Err(format!("Task execution error: {}", e)),
-            })
+            .map(|res| res.map_err(|e| e))
             .collect()
     }
 
@@ -468,10 +578,11 @@ impl DAG {
         nodes: &HashMap<String, Box<dyn Component>>,
         edges: &HashMap<String, Vec<Edge>>,
         initial_inputs: &HashMap<String, Data>,
-    ) -> Result<(String, Data), String> {
-        let component = nodes
-            .get(node_id)
-            .ok_or_else(|| format!("Node {} not found", node_id))?;
+    ) -> Result<(String, Data), DAGError> {
+        let component = nodes.get(node_id).ok_or_else(|| DAGError::ExecutionError {
+            node_id: node_id.to_string(),
+            reason: "Component not found".to_string(),
+        })?;
 
         let expected_input_type = component.input_type();
 
@@ -490,23 +601,26 @@ impl DAG {
         if expected_input_type != DataType::Null
             && !Self::validate_data_type(&input_data, &expected_input_type)
         {
-            return Err(format!(
-                "Runtime type mismatch at node {}. Expected {:?}, got {:?}",
-                node_id,
-                expected_input_type,
-                input_data.get_type()
-            ));
+            return Err(DAGError::TypeMismatch {
+                node_id: node_id.to_string(),
+                expected: expected_input_type,
+                actual: input_data.get_type(),
+            });
         }
 
-        let output = component.execute(input_data);
+        let output = component
+            .execute(input_data)
+            .map_err(|err| DAGError::ExecutionError {
+                node_id: node_id.to_string(),
+                reason: err.to_string(),
+            })?;
 
         if !Self::validate_data_type(&output, &component.output_type()) {
-            return Err(format!(
-                "Component {} produced invalid output type. Expected {:?}, got {:?}",
-                node_id,
-                component.output_type(),
-                output.get_type()
-            ));
+            return Err(DAGError::TypeMismatch {
+                node_id: node_id.to_string(),
+                expected: component.output_type(),
+                actual: output.get_type(),
+            });
         }
 
         Ok((node_id.to_string(), output))
@@ -518,25 +632,27 @@ impl DAG {
         results: &IndexMap<String, Data>,
         initial_inputs: &HashMap<String, Data>,
         expected_input_type: &DataType,
-    ) -> Result<Data, String> {
+    ) -> Result<Data, DAGError> {
         if deps.is_empty() {
             Ok(initial_inputs.get(node_id).cloned().unwrap_or(Data::Null))
         } else if deps.len() == 1 {
             let dep = &deps[0];
-            let dep_output = results
-                .get(&dep.source)
-                .cloned()
-                .ok_or_else(|| format!("Missing output from dependency: {}", dep.source))?;
+            let dep_output =
+                results
+                    .get(&dep.source)
+                    .cloned()
+                    .ok_or_else(|| DAGError::MissingDependency {
+                        node_id: node_id.to_string(),
+                        dependency_id: dep.source.clone(),
+                    })?;
             if Self::validate_data_type(&dep_output, expected_input_type) {
                 Ok(dep_output)
             } else {
-                Err(format!(
-                    "Type mismatch: Dependency {} produced {:?}, but node {} expects {:?}",
-                    dep.source,
-                    dep_output.get_type(),
-                    node_id,
-                    expected_input_type
-                ))
+                Err(DAGError::TypeMismatch {
+                    node_id: node_id.to_string(),
+                    expected: expected_input_type.clone(),
+                    actual: dep_output.get_type(),
+                })
             }
         } else {
             let aggregated_results: Vec<_> = deps
@@ -553,17 +669,17 @@ impl DAG {
                 .collect();
 
             if aggregated_results.is_empty() {
-                Err(format!(
-                    "No compatible inputs for node {} from dependencies {:?}",
-                    node_id, deps
-                ))
+                Err(DAGError::NoValidInputs {
+                    node_id: node_id.to_string(),
+                    expected: expected_input_type.clone(),
+                })
             } else {
                 Ok(Data::List(aggregated_results))
             }
         }
     }
 
-    fn topological_sort(&self) -> Result<Vec<String>, String> {
+    fn topological_sort(&self) -> Result<Vec<String>, DAGError> {
         let mut in_degree = HashMap::new();
         let mut zero_in_degree = vec![];
         let mut sorted = vec![];
@@ -607,7 +723,7 @@ impl DAG {
         }
 
         if sorted.len() != self.nodes.len() {
-            return Err("Cyclic dependency detected".to_string());
+            return Err(DAGError::CycleDetected);
         }
 
         Ok(sorted)
@@ -625,7 +741,7 @@ impl Component for Adder {
         }
     }
 
-    fn execute(&self, input: Data) -> Data {
+    fn execute(&self, input: Data) -> Result<Data, DAGError> {
         println!("Adder input: {:?}", input);
         let input_value = match input {
             Data::Integer(v) => v,
@@ -633,7 +749,7 @@ impl Component for Adder {
             _ => 0,
         };
 
-        Data::Integer(input_value + self.value)
+        Ok(Data::Integer(input_value + self.value))
     }
 
     fn input_type(&self) -> DataType {
@@ -655,9 +771,9 @@ impl Component for StringLengthCounter {
         StringLengthCounter
     }
 
-    fn execute(&self, input: Data) -> Data {
+    fn execute(&self, input: Data) -> Result<Data, DAGError> {
         let len = input.as_text().unwrap_or("").len();
-        Data::Integer(len as i32)
+        Ok(Data::Integer(len as i32))
     }
 
     fn input_type(&self) -> DataType {
@@ -696,7 +812,7 @@ impl Component for WildcardProcessor {
         }
     }
 
-    fn execute(&self, input: Data) -> Data {
+    fn execute(&self, input: Data) -> Result<Data, DAGError> {
         println!("WildcardProcessor input: {:?}", input);
         match input {
             Data::Json(mut value) => {
@@ -706,7 +822,10 @@ impl Component for WildcardProcessor {
 
                 for key in &self.expected_input_keys {
                     if !input_object.contains_key(key) {
-                        return Data::Json(json!({ "error": format!("Missing key: {}", key) }));
+                        return Err(DAGError::ExecutionError {
+                            node_id: "unknown".to_string(),
+                            reason: format!("Missing key: {}", key),
+                        });
                     }
                 }
 
@@ -720,9 +839,12 @@ impl Component for WildcardProcessor {
                     }
                 }
 
-                Data::Json(Value::Object(output_object))
+                Ok(Data::Json(Value::Object(output_object)))
             }
-            _ => Data::Json(json!({ "error": "Invalid input type, expected JSON" })),
+            _ => Err(DAGError::ExecutionError {
+                node_id: "unknown".to_string(),
+                reason: "Invalid input type, expected JSON".to_string(),
+            }),
         }
     }
 
@@ -742,7 +864,7 @@ impl Component for FlexibleWildcardProcessor {
         FlexibleWildcardProcessor
     }
 
-    fn execute(&self, input: Data) -> Data {
+    fn execute(&self, input: Data) -> Result<Data, DAGError> {
         println!("FlexibleWildcardProcessor input: {:?}", input);
         let json_input = match input {
             Data::Null => json!({ "type": "null" }),
@@ -768,7 +890,7 @@ impl Component for FlexibleWildcardProcessor {
             }
         };
 
-        Data::Json(json_input)
+        Ok(Data::Json(json_input))
     }
 
     fn input_type(&self) -> DataType {
@@ -795,7 +917,7 @@ impl Component for LongRunningTask {
         LongRunningTask
     }
 
-    fn execute(&self, _input: Data) -> Data {
+    fn execute(&self, _input: Data) -> Result<Data, DAGError> {
         let (tx, rx) = oneshot::channel();
 
         tokio::spawn(async move {
@@ -806,7 +928,7 @@ impl Component for LongRunningTask {
             let _ = tx.send(result);
         });
 
-        Data::OneConsumerChannel(Arc::new(Mutex::new(Some(rx))))
+        Ok(Data::OneConsumerChannel(Arc::new(Mutex::new(Some(rx)))))
     }
 
     fn input_type(&self) -> DataType {
@@ -836,7 +958,7 @@ impl Component for ChannelConsumer {
         DataType::Integer
     }
 
-    fn execute(&self, input: Data) -> Data {
+    fn execute(&self, input: Data) -> Result<Data, DAGError> {
         println!("ChannelConsumer input: {:?}", input);
         if let Data::OneConsumerChannel(channel) = input {
             let receiver = channel.clone();
@@ -862,22 +984,70 @@ impl Component for ChannelConsumer {
             match result {
                 Ok(Ok(data)) => {
                     println!("ChannelConsumer output: {:?}", data);
-                    data
+                    Ok(data)
                 }
                 Ok(Err(_)) | Err(_) => {
                     eprintln!("ChannelConsumer: Timed out or failed to receive data from channel.");
-                    Data::Integer(-1)
+                    Err(DAGError::ExecutionError {
+                        node_id: "unknown".to_string(),
+                        reason:
+                            "ChannelConsumer: Timed out or failed to receive data from channel."
+                                .to_string(),
+                    })
                 }
             }
         } else {
             eprintln!("ChannelConsumer: Invalid input type.");
-            Data::Integer(-1)
+            Err(DAGError::ExecutionError {
+                node_id: "unknown".to_string(),
+                reason: "ChannelConsumer: Invalid input type.".to_string(),
+            })
         }
     }
 
     /// ChannelConsumer is deferrable because it can be used to wait for a result from a long-running task.
     fn is_deferrable(&self) -> bool {
         true
+    }
+}
+
+pub struct CrashTestDummy {
+    fail: bool,
+    sleep_duration_ms: Option<u64>,
+}
+
+impl Component for CrashTestDummy {
+    fn configure(config: Value) -> Self {
+        let fail = config["fail"].as_bool().unwrap_or(false);
+        let sleep_duration_ms = config["sleep_duration_ms"].as_u64();
+        CrashTestDummy {
+            fail,
+            sleep_duration_ms,
+        }
+    }
+
+    fn execute(&self, _input: Data) -> Result<Data, DAGError> {
+        if let Some(duration) = self.sleep_duration_ms {
+            println!("CrashTestDummy: Sleeping for {}ms", duration);
+            std::thread::sleep(std::time::Duration::from_millis(duration));
+        }
+
+        if self.fail {
+            Err(DAGError::ExecutionError {
+                node_id: "CrashTestDummy".to_string(),
+                reason: "Simulated failure as configured".to_string(),
+            })
+        } else {
+            Ok(Data::Text("Success!".to_string()))
+        }
+    }
+
+    fn input_type(&self) -> DataType {
+        DataType::Null
+    }
+
+    fn output_type(&self) -> DataType {
+        DataType::Text
     }
 }
 
@@ -917,7 +1087,8 @@ async fn main() {
                 "expected_output_keys": ["key2", "key3"]
             },
             "depends_on": [],
-            "inputs": { "key1": "value1", "key2": 42 }
+            "inputs": { "key1": "value1", "key2": 42 },
+            "comment": "Wildcard components give flexibility to just use json inputs and outputs; runtime validation is done with the expected_input_keys and expected_output_keys."
         },
         {
             "id": "wildcard_2",
@@ -933,19 +1104,32 @@ async fn main() {
             "component_type": "FlexibleWildcardProcessor",
             "config": {},
             "depends_on": ["adder_3"],
-            "inputs": { "key1": "value1", "key2": 42 }
+            "inputs": { "key1": "value1", "key2": 42 },
+            "comment": "FlexibleWildcardProcessor shows how to use a component can translate non-json inputs."
         },
         {
             "id": "long_task",
             "component_type": "LongRunningTask",
             "config": {},
-            "depends_on": []
+            "depends_on": [],
+            "comment": "This is a long running task whose consumer will be deferred."
         },
         {
             "id": "consumer",
             "component_type": "ChannelConsumer",
             "config": {},
-            "depends_on": ["long_task"]
+            "depends_on": ["long_task"],
+            "comment": "Consumer componnets are 'deferred' by default, executing as late as possible."
+        },
+        {
+            "id": "crash_dummy_1",
+            "component_type": "CrashTestDummy",
+            "config": {
+                "fail": false,
+                "sleep_duration_ms": 20
+            },
+            "depends_on": ["consumer"],
+            "comment": "This is a testing node that shows how the DAG recovers from a failed node if you configure it to fail."
         }
     ]);
 
@@ -956,6 +1140,7 @@ async fn main() {
     registry.register::<FlexibleWildcardProcessor>("FlexibleWildcardProcessor");
     registry.register::<LongRunningTask>("LongRunningTask");
     registry.register::<ChannelConsumer>("ChannelConsumer");
+    registry.register::<CrashTestDummy>("CrashTestDummy");
 
     let dag_ir = DAGIR::from_json(json_config);
 
