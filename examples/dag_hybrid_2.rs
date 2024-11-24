@@ -163,7 +163,12 @@ trait Component: Send + Sync + 'static {
     fn execute(&self, input: Data) -> Data;
 
     fn input_type(&self) -> DataType;
+
     fn output_type(&self) -> DataType;
+
+    fn is_deferrable(&self) -> bool {
+        false
+    }
 }
 
 struct ComponentRegistry {
@@ -192,33 +197,43 @@ impl ComponentRegistry {
 #[derive(Debug)]
 struct NodeIR {
     id: String,
+    namespace: Option<String>,
     component_type: String,
     config: Value,
-    depends_on: Vec<String>,
     inputs: Option<Data>,
 }
 
 #[derive(Debug)]
 struct DAGIR {
     nodes: Vec<NodeIR>,
+    edges: HashMap<String, Vec<Edge>>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct Edge {
+    source: String,
+    target: String,
+    target_input: String,
 }
 
 impl DAGIR {
     fn from_json(json_config: Value) -> Self {
-        let nodes = json_config
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|node| NodeIR {
-                id: node["id"].as_str().unwrap().to_string(),
-                component_type: node["component_type"].as_str().unwrap().to_string(),
-                config: node["config"].clone(),
-                depends_on: node["depends_on"]
-                    .as_array()
-                    .unwrap_or(&vec![])
-                    .iter()
-                    .map(|v| v.as_str().unwrap().to_string())
-                    .collect(),
+        let mut nodes = Vec::new();
+        let mut edges: HashMap<String, Vec<Edge>> = HashMap::new();
+
+        for node in json_config.as_array().unwrap() {
+            let id = node["id"].as_str().unwrap().to_string();
+            let component_type = node["component_type"].as_str().unwrap().to_string();
+            let config = node["config"].clone();
+            let namespace = node
+                .get("namespace")
+                .and_then(|v| v.as_str().map(String::from));
+
+            nodes.push(NodeIR {
+                id: id.clone(),
+                namespace,
+                component_type,
+                config,
                 inputs: node.get("inputs").map(|v| match v {
                     Value::String(s) => Data::Text(s.clone()),
                     Value::Number(n) => {
@@ -242,51 +257,37 @@ impl DAGIR {
                     Value::Object(_) => Data::Json(v.clone()),
                     _ => panic!("Unsupported input type in JSON configuration"),
                 }),
-            })
-            .collect();
+            });
 
-        DAGIR { nodes }
+            if let Some(depends_on) = node["depends_on"].as_array() {
+                for dep in depends_on {
+                    let source = dep.as_str().unwrap().to_string();
+                    edges
+                        .entry(source.clone())
+                        .or_insert_with(Vec::new)
+                        .push(Edge {
+                            source,
+                            target: id.clone(),
+                            target_input: "".to_string(),
+                        });
+                }
+            }
+        }
+
+        DAGIR { nodes, edges }
     }
 }
 
 struct DAG {
     nodes: Arc<HashMap<String, Box<dyn Component>>>,
-    edges: Arc<HashMap<String, Vec<String>>>,
+    edges: Arc<HashMap<String, Vec<Edge>>>,
     initial_inputs: Arc<HashMap<String, Data>>,
 }
 
 impl DAG {
-    /// Constructs a `DAG` instance from its intermediate representation (`DAGIR`) and a component registry.
-    ///
-    /// This method performs the following tasks:
-    /// 1. Creates a mapping of node IDs to components by instantiating each component from its configuration.
-    /// 2. Builds the dependency graph (`edges`) based on the `depends_on` relationships.
-    /// 3. Validates the input types for each node:
-    ///    - Ensures single-dependency nodes accept the output type of their upstream component.
-    ///    - Ensures multi-dependency nodes declare an input type compatible with `Data::List`.
-    /// 4. Collects any initial inputs provided for nodes.
-    ///
-    /// ### Validation:
-    /// - If a node depends on multiple upstream nodes, it must declare an input type that
-    ///   can accept a `Data::List` (directly or via a `DataType::Union` containing `DataType::List`).
-    /// - Type mismatches are detected and reported with descriptive error messages.
-    ///
-    /// ### Errors:
-    /// - Returns an error if:
-    ///   - A node's component type is not found in the registry.
-    ///   - A node's initial input type does not match the declared input type.
-    ///   - A node's input type is incompatible with its dependencies.
-    ///
-    /// ### Parameters:
-    /// - `ir`: The intermediate representation of the DAG (`DAGIR`).
-    /// - `registry`: A registry of available component types (`ComponentRegistry`).
-    ///
-    /// ### Returns:
-    /// - `Ok(Self)`: The constructed `DAG` instance.
-    /// - `Err(String)`: An error message describing the validation failure.
     fn from_ir(ir: DAGIR, registry: &ComponentRegistry) -> Result<Self, String> {
         let mut nodes = HashMap::new();
-        let mut edges = HashMap::new();
+        let mut edges: HashMap<String, Vec<Edge>> = HashMap::new();
         let mut initial_inputs = HashMap::new();
 
         for node in ir.nodes {
@@ -307,62 +308,16 @@ impl DAG {
                 initial_inputs.insert(node.id.clone(), input.clone());
             }
 
-            nodes.insert(node.id.clone(), component);
-            edges.insert(node.id.clone(), node.depends_on);
-        }
-
-        for (node_id, deps) in &edges {
-            let target_component = nodes.get(node_id).unwrap();
-            let expected_input_type = target_component.input_type();
-
-            if deps.len() == 1 {
-                let source_component = nodes.get(&deps[0]).unwrap();
-                let source_type = source_component.output_type();
-
-                if !source_type.is_compatible_with(&expected_input_type) {
-                    return Err(format!(
-                        "Type mismatch: Node {} outputs {:?}, but node {} expects {:?}",
-                        deps[0], source_type, node_id, expected_input_type
-                    ));
-                }
-            } else if deps.len() > 1 {
-                let accepts_list = match &expected_input_type {
-                    DataType::List(_) => true,
-                    DataType::Union(types) => types.iter().any(|t| matches!(t, DataType::List(_))),
-                    _ => false,
-                };
-
-                if !accepts_list {
-                    return Err(format!(
-                            "Validation error: Node {} depends on multiple nodes ({:?}) but its input type {:?} does not accept a List",
-                            node_id, deps, expected_input_type
-                        ));
-                }
-
-                let expected_element_type = match &expected_input_type {
-                    DataType::List(elem_type) => elem_type,
-                    DataType::Union(types) => types
-                        .iter()
-                        .find_map(|t| match t {
-                            DataType::List(elem_type) => Some(elem_type),
-                            _ => None,
-                        })
-                        .unwrap(),
-                    _ => unreachable!(),
-                };
-
+            if let Some(deps) = ir.edges.get(&node.id) {
                 for dep in deps {
-                    let source_component = nodes.get(dep).unwrap();
-                    let source_type = source_component.output_type();
-
-                    if !source_type.is_compatible_with(expected_element_type) {
-                        return Err(format!(
-                                "Type mismatch in list input: Node {} outputs {:?}, but node {} expects elements of type {:?}",
-                                dep, source_type, node_id, expected_element_type
-                            ));
-                    }
+                    edges
+                        .entry(dep.target.clone())
+                        .or_insert_with(Vec::new)
+                        .push(dep.clone());
                 }
             }
+
+            nodes.insert(node.id.clone(), component);
         }
 
         Ok(Self {
@@ -375,14 +330,13 @@ impl DAG {
     fn validate_data_type(data: &Data, expected_type: &DataType) -> bool {
         match expected_type {
             DataType::Null => matches!(data, Data::Null),
-            DataType::Union(types) => types.iter().any(|t| Self::validate_data_type(data, t)),
             DataType::Integer => matches!(data, Data::Integer(_)),
             DataType::Text => matches!(data, Data::Text(_)),
             DataType::List(element_type) => {
                 if let Data::List(items) = data {
                     items
                         .iter()
-                        .all(|item| Self::validate_data_type(item, element_type))
+                        .all(|item| DAG::validate_data_type(item, element_type))
                 } else {
                     false
                 }
@@ -390,6 +344,7 @@ impl DAG {
             DataType::Json => matches!(data, Data::Json(_)),
             DataType::OneConsumerChannel(_) => matches!(data, Data::OneConsumerChannel(_)),
             DataType::MultiConsumerChannel(_) => matches!(data, Data::MultiConsumerChannel(_)),
+            DataType::Union(types) => types.iter().any(|t| DAG::validate_data_type(data, t)),
         }
     }
 
@@ -406,16 +361,21 @@ impl DAG {
     fn group_into_levels(&self, sorted_nodes: Vec<String>) -> Result<Vec<Vec<String>>, String> {
         let mut levels: Vec<Vec<String>> = Vec::new();
         let mut remaining_nodes: HashSet<String> = sorted_nodes.into_iter().collect();
+        let mut deferred_nodes: Vec<String> = Vec::new();
 
         while !remaining_nodes.is_empty() {
             let mut current_level = Vec::new();
 
             let ready_nodes: Vec<_> = remaining_nodes
                 .iter()
-                .filter(|node| {
-                    let deps = self.edges.get(*node).map(|d| d.as_slice()).unwrap_or(&[]);
-
-                    deps.iter().all(|dep| !remaining_nodes.contains(dep))
+                .filter(|node_id| {
+                    let deps = self
+                        .edges
+                        .get(*node_id)
+                        .map(|d| d.as_slice())
+                        .unwrap_or(&[]);
+                    deps.iter()
+                        .all(|dep| !remaining_nodes.contains(&dep.source))
                 })
                 .cloned()
                 .collect();
@@ -425,11 +385,30 @@ impl DAG {
             }
 
             for node in ready_nodes {
-                current_level.push(node.clone());
+                let component = self
+                    .nodes
+                    .get(&node)
+                    .ok_or_else(|| format!("Node {} not found", node))?;
+
+                if component.is_deferrable() {
+                    deferred_nodes.push(node.clone());
+                } else {
+                    current_level.push(node.clone());
+                }
                 remaining_nodes.remove(&node);
             }
 
-            levels.push(current_level);
+            if !current_level.is_empty() {
+                levels.push(current_level);
+            }
+        }
+
+        if !deferred_nodes.is_empty() {
+            if levels.is_empty() {
+                levels.push(deferred_nodes);
+            } else {
+                levels.last_mut().unwrap().extend(deferred_nodes);
+            }
         }
 
         Ok(levels)
@@ -487,7 +466,7 @@ impl DAG {
         node_id: &str,
         results: &IndexMap<String, Data>,
         nodes: &HashMap<String, Box<dyn Component>>,
-        edges: &HashMap<String, Vec<String>>,
+        edges: &HashMap<String, Vec<Edge>>,
         initial_inputs: &HashMap<String, Data>,
     ) -> Result<(String, Data), String> {
         let component = nodes
@@ -497,13 +476,14 @@ impl DAG {
         let expected_input_type = component.input_type();
 
         let input_data = if expected_input_type == DataType::Null {
-            Data::Json(serde_json::Value::Null)
+            Data::Null
         } else {
             Self::prepare_input_data(
                 node_id,
-                edges.get(node_id).map(|d| d.as_slice()).unwrap_or(&[]),
+                edges.get(node_id).map(|e| e.as_slice()).unwrap_or(&[]),
                 results,
                 initial_inputs,
+                &expected_input_type,
             )?
         };
 
@@ -534,31 +514,52 @@ impl DAG {
 
     fn prepare_input_data(
         node_id: &str,
-        deps: &[String],
+        deps: &[Edge],
         results: &IndexMap<String, Data>,
         initial_inputs: &HashMap<String, Data>,
+        expected_input_type: &DataType,
     ) -> Result<Data, String> {
         if deps.is_empty() {
-            Ok(initial_inputs
-                .get(node_id)
-                .cloned()
-                .unwrap_or(Data::List(vec![])))
+            Ok(initial_inputs.get(node_id).cloned().unwrap_or(Data::Null))
         } else if deps.len() == 1 {
-            results
-                .get(&deps[0])
+            let dep = &deps[0];
+            let dep_output = results
+                .get(&dep.source)
                 .cloned()
-                .ok_or_else(|| format!("Missing output from dependency: {}", deps[0]))
+                .ok_or_else(|| format!("Missing output from dependency: {}", dep.source))?;
+            if Self::validate_data_type(&dep_output, expected_input_type) {
+                Ok(dep_output)
+            } else {
+                Err(format!(
+                    "Type mismatch: Dependency {} produced {:?}, but node {} expects {:?}",
+                    dep.source,
+                    dep_output.get_type(),
+                    node_id,
+                    expected_input_type
+                ))
+            }
         } else {
-            Ok(Data::List(
-                deps.iter()
-                    .map(|dep| {
-                        results
-                            .get(dep)
-                            .cloned()
-                            .ok_or_else(|| format!("Missing output from dependency: {}", dep))
+            let aggregated_results: Vec<_> = deps
+                .iter()
+                .filter_map(|dep| {
+                    results.get(&dep.source).cloned().and_then(|data| {
+                        if Self::validate_data_type(&data, expected_input_type) {
+                            Some(data)
+                        } else {
+                            None
+                        }
                     })
-                    .collect::<Result<Vec<_>, String>>()?,
-            ))
+                })
+                .collect();
+
+            if aggregated_results.is_empty() {
+                Err(format!(
+                    "No compatible inputs for node {} from dependencies {:?}",
+                    node_id, deps
+                ))
+            } else {
+                Ok(Data::List(aggregated_results))
+            }
         }
     }
 
@@ -578,7 +579,7 @@ impl DAG {
 
             for dep in deps {
                 reverse_deps
-                    .entry(dep.clone())
+                    .entry(dep.source.clone())
                     .or_default()
                     .push(node.clone());
             }
@@ -590,10 +591,10 @@ impl DAG {
             }
         }
 
-        while let Some(node) = zero_in_degree.pop() {
-            sorted.push(node.clone());
+        while let Some(node_id) = zero_in_degree.pop() {
+            sorted.push(node_id.clone());
 
-            if let Some(dependent_nodes) = reverse_deps.get(&node) {
+            if let Some(dependent_nodes) = reverse_deps.get(&node_id) {
                 for dep_node in dependent_nodes {
                     if let Some(deg) = in_degree.get_mut(dep_node) {
                         *deg -= 1;
@@ -628,7 +629,7 @@ impl Component for Adder {
         println!("Adder input: {:?}", input);
         let input_value = match input {
             Data::Integer(v) => v,
-            Data::List(list) => list.iter().filter_map(|v| v.as_integer()).sum(),
+            Data::List(list) => list.into_iter().filter_map(|v| v.as_integer()).sum(),
             _ => 0,
         };
 
@@ -798,6 +799,7 @@ impl Component for LongRunningTask {
         let (tx, rx) = oneshot::channel();
 
         tokio::spawn(async move {
+            println!("LongRunningTask: Sleeping for 30ms");
             tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
 
             let result = Data::Integer(42);
@@ -871,6 +873,11 @@ impl Component for ChannelConsumer {
             eprintln!("ChannelConsumer: Invalid input type.");
             Data::Integer(-1)
         }
+    }
+
+    /// ChannelConsumer is deferrable because it can be used to wait for a result from a long-running task.
+    fn is_deferrable(&self) -> bool {
+        true
     }
 }
 
